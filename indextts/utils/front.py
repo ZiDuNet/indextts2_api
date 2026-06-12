@@ -113,47 +113,16 @@ class TextNormalizer:
         return has_pinyin
 
     def load(self):
-        # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-        # sys.path.append(model_dir)
-        import platform
         if self.zh_normalizer is not None and self.en_normalizer is not None:
             return
-        if platform.system() != "Linux":  # Mac and Windows
-            # 预检测 kaldifst 是否能安全导入（Windows 上可能 DLL 不兼容导致 segfault）
-            _kaldifst_ok = False
-            try:
-                import subprocess, sys
-                result = subprocess.run(
-                    [sys.executable, "-c", "import kaldifst"],
-                    timeout=10, capture_output=True,
-                )
-                _kaldifst_ok = result.returncode == 0
-            except Exception:
-                pass
-            if _kaldifst_ok:
-                try:
-                    from wetext import Normalizer
-                    self.zh_normalizer = Normalizer(remove_erhua=False, lang="zh", operator="tn")
-                    self.en_normalizer = Normalizer(lang="en", operator="tn")
-                except Exception:
-                    self.zh_normalizer = None
-                    self.en_normalizer = None
-            else:
-                self.zh_normalizer = None
-                self.en_normalizer = None
-        else:
-            from tn.chinese.normalizer import Normalizer as NormalizerZh
-            from tn.english.normalizer import Normalizer as NormalizerEn
-            # use new cache dir for build tagger rules with disable remove_interjections and remove_erhua
-            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tagger_cache")
-            if not os.path.exists(cache_dir):
-                os.makedirs(cache_dir)
-                with open(os.path.join(cache_dir, ".gitignore"), "w") as f:
-                    f.write("*\n")
-            self.zh_normalizer = NormalizerZh(
-                cache_dir=cache_dir, remove_interjections=False, remove_erhua=False, overwrite_cache=False
-            )
-            self.en_normalizer = NormalizerEn(overwrite_cache=False)
+        # 所有平台统一使用 wetext（避免 WeTextProcessing/pynini 编译问题）
+        try:
+            from wetext import Normalizer
+            self.zh_normalizer = Normalizer(remove_erhua=False, lang="zh", operator="tn")
+            self.en_normalizer = Normalizer(lang="en", operator="tn")
+        except Exception:
+            self.zh_normalizer = None
+            self.en_normalizer = None
 
     def normalize(self, text: str) -> str:
         if not self.zh_normalizer or not self.en_normalizer:

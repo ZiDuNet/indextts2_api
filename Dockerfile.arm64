@@ -36,9 +36,9 @@ COPY . /app
 # path by leaving --use_cuda_kernel disabled in the runtime command.
 RUN uv sync --locked --python /usr/bin/python3.12 --extra webui --no-dev \
     --default-index "https://mirrors.aliyun.com/pypi/simple" \
-    && uv run python -c "import platform, torch, torchaudio; print(platform.machine(), torch.__version__, torch.version.cuda, torchaudio.__version__)"
+    && uv run --locked --extra webui --no-dev python -c "import platform, torch, torchaudio, gradio; print(platform.machine(), torch.__version__, torch.version.cuda, torchaudio.__version__, gradio.__version__)"
 
 EXPOSE 8002
 
 ENTRYPOINT ["tini", "--"]
-CMD ["uv", "run", "python", "api_server.py", "--host", "0.0.0.0", "--port", "8002", "--fp16"]
+CMD ["uv", "run", "--locked", "--extra", "webui", "--no-dev", "python", "api_server.py", "--host", "0.0.0.0", "--port", "8002", "--fp16"]

@@ -1,7 +1,7 @@
 # IndexTTS2 x86 Dockerfile
-# 适用于 x86_64 架构 (CUDA 12.x)
+# 最小化基础镜像 + CUDA runtime 按需安装
 
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -10,11 +10,18 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
-# 使用阿里云 apt 源（国内加速）
+# 阿里云 apt 源 + NVIDIA CUDA 12.8 仓库
 RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list
+    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y wget gnupg2 && \
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        cuda-cudart-12-8 cuda-libraries-12-8 libcudnn8 libcublas-12-8 && \
+    rm -rf /var/lib/apt/lists/*
 
-# 安装系统依赖
+# 系统依赖 + Python 3.11
 RUN apt-get update && apt-get install -y \
     software-properties-common && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
@@ -37,5 +44,4 @@ RUN uv sync --all-extras --default-index "https://mirrors.aliyun.com/pypi/simple
 
 EXPOSE 8002
 
-# 启动 API 服务器
 CMD ["uv", "run", "python", "api_server.py", "--host", "0.0.0.0", "--port", "8002", "--fp16"]

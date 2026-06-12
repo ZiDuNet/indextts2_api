@@ -524,15 +524,17 @@ class IndexTTS2:
             print("segments count:", segments_count)
             print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
             print(*segments, sep="\n")
-        do_sample = generation_kwargs.pop("do_sample", True)
-        top_p = generation_kwargs.pop("top_p", 0.8)
-        top_k = generation_kwargs.pop("top_k", 30)
-        temperature = generation_kwargs.pop("temperature", 0.8)
+        do_sample = bool(generation_kwargs.pop("do_sample", True))
+        top_p = float(generation_kwargs.pop("top_p", 0.8))
+        top_k = int(generation_kwargs.pop("top_k", 30))
+        temperature = float(generation_kwargs.pop("temperature", 0.8))
         autoregressive_batch_size = 1
-        length_penalty = generation_kwargs.pop("length_penalty", 0.0)
-        num_beams = generation_kwargs.pop("num_beams", 3)
-        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
-        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        length_penalty = float(generation_kwargs.pop("length_penalty", 0.0))
+        num_beams = int(generation_kwargs.pop("num_beams", 3))
+        repetition_penalty = float(generation_kwargs.pop("repetition_penalty", 10.0))
+        max_mel_tokens = int(generation_kwargs.pop("max_mel_tokens", 1500))
+        diffusion_steps = int(generation_kwargs.pop("diffusion_steps", 25))
+        inference_cfg_rate = float(generation_kwargs.pop("inference_cfg_rate", 0.7))
         sampling_rate = 22050
 
         wavs = []
@@ -577,7 +579,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=True,
+                        do_sample=do_sample,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -643,8 +645,8 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
-                    inference_cfg_rate = 0.7
+                    diffusion_steps = int(diffusion_steps)
+                    inference_cfg_rate = float(inference_cfg_rate)
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)

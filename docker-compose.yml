@@ -14,6 +14,11 @@ services:
       - ./outputs:/app/outputs
     environment:
       - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - INDEXTTS_MAX_CONCURRENCY=1
+      - INDEXTTS_QUEUE_SIZE=16
+      - INDEXTTS_QUEUE_TIMEOUT=120
       - SKIP_MODEL_DOWNLOAD=1
     deploy:
       resources:

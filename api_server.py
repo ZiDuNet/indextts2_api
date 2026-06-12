@@ -40,32 +40,36 @@ args: argparse.Namespace = None
 SPEAKER_CACHE_DIR = "assets/speaker_cache"
 SPEAKER_META_FILE = os.path.join(SPEAKER_CACHE_DIR, "meta.json")
 
-# 并发控制：GPU 推理信号量（同时只允许一个推理任务，请求排队）
 _gpu_semaphore: Optional[asyncio.Semaphore] = None
-# 音色元数据内存缓存
+_queue_slots: Optional[asyncio.Semaphore] = None
 _meta_cache: Optional[dict] = None
+_meta_mtime: Optional[float] = None
 
 
 # ============== 音色缓存管理 ==============
 
 def _load_meta() -> dict:
-    global _meta_cache
-    if _meta_cache is not None:
-        return _meta_cache
+    global _meta_cache, _meta_mtime
     if os.path.exists(SPEAKER_META_FILE):
+        mtime = os.path.getmtime(SPEAKER_META_FILE)
+        if _meta_cache is not None and _meta_mtime == mtime:
+            return _meta_cache
         with open(SPEAKER_META_FILE, "r", encoding="utf-8") as f:
             _meta_cache = json.load(f)
-            return _meta_cache
+        _meta_mtime = mtime
+        return _meta_cache
     _meta_cache = {}
+    _meta_mtime = None
     return _meta_cache
 
 
 def _save_meta(meta: dict):
-    global _meta_cache
+    global _meta_cache, _meta_mtime
     _meta_cache = meta
     os.makedirs(SPEAKER_CACHE_DIR, exist_ok=True)
     with open(SPEAKER_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    _meta_mtime = os.path.getmtime(SPEAKER_META_FILE)
 
 
 def _md5_file(path: str) -> str:
@@ -80,6 +84,13 @@ def _md5_file(path: str) -> str:
 
 def _extract_params(data: dict) -> dict:
     """从请求体中提取推理参数，返回 infer() 需要的 kwargs"""
+    def as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     params = {}
     for key in ("emo_audio_prompt", "emo_alpha", "emo_vector", "use_emo_text",
                 "emo_text", "use_random"):
@@ -87,18 +98,34 @@ def _extract_params(data: dict) -> dict:
             params[key] = data[key]
     if "emo_alpha" not in params:
         params["emo_alpha"] = 1.0
+    else:
+        params["emo_alpha"] = float(params["emo_alpha"])
     if "emo_vector" in params:
         v = params["emo_vector"]
         if not isinstance(v, list) or len(v) != 8:
             raise ValueError("emo_vector 必须是长度为 8 的数组 [高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静]")
         params["emo_vector"] = [float(x) for x in v]
-    for key in ("interval_silence", "max_text_tokens_per_segment"):
-        if key in data:
-            params[key] = data[key]
-    for key in ("num_beams", "do_sample", "top_k", "top_p", "temperature",
-                "max_mel_tokens", "length_penalty", "repetition_penalty"):
-        if key in data:
-            params[key] = data[key]
+    for key in ("use_emo_text", "use_random", "do_sample"):
+        if key in params:
+            params[key] = as_bool(params[key])
+        elif key in data:
+            params[key] = as_bool(data[key])
+    for key in ("interval_silence", "max_text_tokens_per_segment",
+                "num_beams", "top_k", "max_mel_tokens", "diffusion_steps"):
+        if key in data and data[key] is not None:
+            params[key] = int(data[key])
+    for key in ("top_p", "temperature", "length_penalty", "repetition_penalty",
+                "inference_cfg_rate"):
+        if key in data and data[key] is not None:
+            params[key] = float(data[key])
+    if params.get("repetition_penalty", 10.0) <= 0:
+        raise ValueError("repetition_penalty 必须大于 0")
+    if params.get("temperature", 0.8) <= 0:
+        raise ValueError("temperature 必须大于 0")
+    if "top_p" in params and not 0 <= params["top_p"] <= 1:
+        raise ValueError("top_p 必须在 0 到 1 之间")
+    if "diffusion_steps" in params and params["diffusion_steps"] < 1:
+        raise ValueError("diffusion_steps 必须大于 0")
     return params
 
 
@@ -151,10 +178,40 @@ def _do_infer(text: str, spk_audio_prompt: str, output_path: str, params: dict):
     return result
 
 
+async def _acquire_with_timeout(semaphore: asyncio.Semaphore, timeout: float) -> bool:
+    try:
+        await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
 async def _guarded_infer(text: str, spk: str, output_path: str, params: dict):
     """带信号量保护的推理，控制 GPU 并发"""
-    async with _gpu_semaphore:
-        return await asyncio.to_thread(_do_infer, text, spk, output_path, params)
+    request_start = time.perf_counter()
+    if _queue_slots is None or _gpu_semaphore is None:
+        raise RuntimeError("推理队列尚未初始化")
+
+    accepted = await _acquire_with_timeout(_queue_slots, args.queue_timeout)
+    if not accepted:
+        raise TimeoutError(f"推理队列已满，请稍后重试（等待超过 {args.queue_timeout:.1f}s）")
+
+    try:
+        await _gpu_semaphore.acquire()
+        queue_elapsed = time.perf_counter() - request_start
+        infer_start = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(_do_infer, text, spk, output_path, params)
+        finally:
+            _gpu_semaphore.release()
+        return {
+            "result": result,
+            "queue_time": queue_elapsed,
+            "infer_time": time.perf_counter() - infer_start,
+            "total_time": time.perf_counter() - request_start,
+        }
+    finally:
+        _queue_slots.release()
 
 
 # ============== WebSocket 管理 ==============
@@ -232,8 +289,9 @@ def _ensure_main_model(model_dir: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts, _gpu_semaphore
-    _gpu_semaphore = asyncio.Semaphore(1)
+    global tts, _gpu_semaphore, _queue_slots
+    _gpu_semaphore = asyncio.Semaphore(args.max_concurrency)
+    _queue_slots = asyncio.Semaphore(args.max_concurrency + args.queue_size)
 
     # 自动下载主模型（缓存到 H 盘）
     _ensure_main_model(args.model_dir)
@@ -248,6 +306,8 @@ async def lifespan(app: FastAPI):
             use_fp16=args.fp16,
             device=device,
             use_cuda_kernel=False,
+            use_deepspeed=args.deepspeed,
+            use_accel=args.accel,
             use_torch_compile=False,
         )
         logger.info("IndexTTS2 initialized successfully")
@@ -292,7 +352,10 @@ async def health_check():
         return {"status": "partial", "model_loaded": False,
                 "message": "模型未初始化"}
     return {"status": "healthy", "model_loaded": True,
-            "timestamp": time.time(), "device": str(tts.device)}
+            "timestamp": time.time(), "device": str(tts.device),
+            "max_concurrency": args.max_concurrency,
+            "queue_size": args.queue_size,
+            "queue_timeout": args.queue_timeout}
 
 
 # ============== 音色管理 (/v1/audio/voices) ==============
@@ -435,18 +498,31 @@ async def openai_speech(request: Request):
         output_path = _unique_output_path()
         os.makedirs("outputs", exist_ok=True)
 
-        start = time.perf_counter()
-        result = await _guarded_infer(text.strip(), spk_audio_prompt, output_path, params)
-        elapsed = time.perf_counter() - start
+        infer_record = await _guarded_infer(text.strip(), spk_audio_prompt, output_path, params)
+        result = infer_record["result"]
 
         if result is None:
             return JSONResponse(status_code=500, content={"error": "合成失败，模型返回空结果"})
 
         sr, wav = result
-        logger.info(f"TTS 完成: {len(text)}字, {elapsed:.2f}s, 格式: {output_format}")
+        logger.info(
+            f"TTS 完成: {len(text)}字, queue={infer_record['queue_time']:.2f}s, "
+            f"infer={infer_record['infer_time']:.2f}s, 格式: {output_format}"
+        )
 
         audio_bytes, media_type = _encode_audio(wav, sr, output_format)
-        return Response(content=audio_bytes, media_type=media_type)
+        return Response(
+            content=audio_bytes,
+            media_type=media_type,
+            headers={
+                "X-IndexTTS-Voice": voice,
+                "X-IndexTTS-Sample-Rate": str(sr),
+                "X-IndexTTS-Queue-Time": f"{infer_record['queue_time']:.3f}",
+                "X-IndexTTS-Infer-Time": f"{infer_record['infer_time']:.3f}",
+                "X-IndexTTS-Total-Time": f"{infer_record['total_time']:.3f}",
+                "X-IndexTTS-Output-Format": output_format,
+            },
+        )
 
     except Exception as e:
         logger.error(f"TTS 失败: {e}")
@@ -490,7 +566,8 @@ async def websocket_endpoint(ws: WebSocket):
                         await manager.send_json({"type": "stream_started"}, ws)
 
                     output_path = _unique_output_path("ws_")
-                    result = await _guarded_infer(text, spk, output_path, params)
+                    infer_record = await _guarded_infer(text, spk, output_path, params)
+                    result = infer_record["result"]
 
                     if result:
                         sr, wav = result
@@ -502,6 +579,9 @@ async def websocket_endpoint(ws: WebSocket):
                             "type": "stream_completed" if msg_type == "tts_stream" else "completed",
                             "audio_base64": base64.b64encode(wav_bytes).decode(),
                             "sample_rate": sr,
+                            "queue_time": round(infer_record["queue_time"], 3),
+                            "infer_time": round(infer_record["infer_time"], 3),
+                            "total_time": round(infer_record["total_time"], 3),
                         }, ws)
                     else:
                         await manager.send_json({"type": "error", "message": "合成失败"}, ws)
@@ -543,7 +623,30 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", type=str, default="checkpoints/IndexTTS-2", help="模型目录")
     parser.add_argument("--device", type=str, default="auto", help="设备 (auto/cuda/cpu)")
     parser.add_argument("--fp16", action="store_true", help="使用 FP16")
+    parser.add_argument(
+        "--max_concurrency",
+        type=int,
+        default=int(os.environ.get("INDEXTTS_MAX_CONCURRENCY", "1")),
+        help="同时进入模型推理的请求数。单 GPU 建议从 1 开始。",
+    )
+    parser.add_argument(
+        "--queue_size",
+        type=int,
+        default=int(os.environ.get("INDEXTTS_QUEUE_SIZE", "16")),
+        help="推理队列等待名额数，超过后返回队列超时错误。",
+    )
+    parser.add_argument(
+        "--queue_timeout",
+        type=float,
+        default=float(os.environ.get("INDEXTTS_QUEUE_TIMEOUT", "120")),
+        help="请求等待进入推理队列的最长秒数。",
+    )
+    parser.add_argument("--deepspeed", action="store_true", help="启用 DeepSpeed GPT 推理加速")
+    parser.add_argument("--accel", action="store_true", help="启用项目自带 GPT accel engine")
     args = parser.parse_args()
+    args.max_concurrency = max(1, args.max_concurrency)
+    args.queue_size = max(0, args.queue_size)
+    args.queue_timeout = max(0.1, args.queue_timeout)
 
     os.makedirs("outputs", exist_ok=True)
     os.makedirs("logs", exist_ok=True)

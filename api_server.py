@@ -202,7 +202,11 @@ def _ensure_main_model(model_dir: str):
             for item in os.listdir(src_dir):
                 src = os.path.join(src_dir, item)
                 dst = os.path.join(model_dir, item)
-                if not os.path.exists(dst):
+                if os.path.exists(dst):
+                    continue
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
                     shutil.copy2(src, dst)
             logger.info(f"主模型下载完成: {model_dir}")
     except Exception as e:

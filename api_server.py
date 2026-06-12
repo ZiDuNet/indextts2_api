@@ -358,6 +358,67 @@ async def health_check():
             "queue_timeout": args.queue_timeout}
 
 
+@app.get("/ws/docs", tags=["WebSocket"])
+async def websocket_docs():
+    """WebSocket 接口说明。OpenAPI 不原生展示 ws:// 路由，因此用 HTTP 端点暴露文档。"""
+    return {
+        "endpoint": "/ws",
+        "protocol": "websocket",
+        "url_example": "ws://localhost:8002/ws",
+        "message_types": {
+            "tts": "普通 WebSocket 合成，完成后一次性返回 base64 WAV",
+            "tts_stream": "流式合成入口，当前实现完成后返回 base64 WAV",
+            "ping": "心跳检测，返回 pong",
+            "get_voices": "返回当前音色元数据",
+        },
+        "tts_request_example": {
+            "type": "tts",
+            "text": "你好，这是 WebSocket 合成测试。",
+            "voice": "spk_xxxxxxxx",
+            "num_beams": 1,
+            "do_sample": False,
+            "top_k": 10,
+            "top_p": 0.8,
+            "temperature": 0.8,
+            "max_mel_tokens": 900,
+            "diffusion_steps": 12,
+            "repetition_penalty": 10.0,
+        },
+        "tts_response_example": {
+            "type": "completed",
+            "audio_base64": "<wav base64>",
+            "sample_rate": 22050,
+            "queue_time": 0.0,
+            "infer_time": 1.23,
+            "total_time": 1.23,
+        },
+        "supported_speech_params": [
+            "voice",
+            "text",
+            "speaker_id",
+            "spk_audio_prompt",
+            "emo_audio_prompt",
+            "emo_alpha",
+            "emo_vector",
+            "use_emo_text",
+            "emo_text",
+            "use_random",
+            "interval_silence",
+            "max_text_tokens_per_segment",
+            "num_beams",
+            "do_sample",
+            "top_k",
+            "top_p",
+            "temperature",
+            "max_mel_tokens",
+            "length_penalty",
+            "repetition_penalty",
+            "diffusion_steps",
+            "inference_cfg_rate",
+        ],
+    }
+
+
 # ============== 音色管理 (/v1/audio/voices) ==============
 
 @app.post("/v1/audio/voices", tags=["音色管理"])

@@ -102,16 +102,25 @@ no-build-isolation-package = ["deepspeed"]
 # versions will not be selected if they're only third-party dependencies.
 torch = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' or sys_platform == 'win32'" },
+  { index = "pytorch-cuda130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchaudio = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' or sys_platform == 'win32'" },
+  { index = "pytorch-cuda130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchvision = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' or sys_platform == 'win32'" },
+  { index = "pytorch-cuda130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
 # PyTorch with CUDA 12.8（南京大学镜像加速）
 url = "https://mirrors.nju.edu.cn/pytorch/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda130"
+# PyTorch with CUDA 13.x for ARM64 (NVIDIA GB10 / Blackwell, CUDA driver >= 580)
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true

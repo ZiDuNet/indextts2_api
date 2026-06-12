@@ -1,0 +1,32 @@
+# IndexTTS2 Docker Compose (x86)
+
+version: '3.8'
+
+services:
+  indextts2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./examples:/app/examples
+      - ./assets:/app/assets
+      - ./outputs:/app/outputs
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

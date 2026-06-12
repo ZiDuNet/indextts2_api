@@ -9,7 +9,9 @@ import asyncio
 import base64
 import json
 import os
+import threading
 import time
+import uuid
 from pathlib import Path
 
 import gradio as gr
@@ -17,6 +19,8 @@ import requests
 
 
 DEFAULT_API_BASE = os.environ.get("INDEXTTS_API_BASE", "http://127.0.0.1:8002").rstrip("/")
+WS_SESSIONS: dict[str, "WebSocketSession"] = {}
+WS_LOCK = threading.Lock()
 
 
 def _pretty(data) -> str:
@@ -47,10 +51,17 @@ def _headers_dict(headers) -> dict:
 
 
 def _save_response(content: bytes, response_format: str, prefix: str) -> str:
-    ext = {"wav": "wav", "mp3": "mp3", "pcm": "pcm"}.get(response_format, "bin")
+    ext = {
+        "mp3": "mp3",
+        "opus": "opus",
+        "aac": "aac",
+        "flac": "flac",
+        "wav": "wav",
+        "pcm": "pcm",
+    }.get(response_format, "bin")
     out_dir = Path("outputs")
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.{ext}"
+    path = out_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.{ext}"
     path.write_bytes(content)
     return str(path)
 
@@ -80,6 +91,66 @@ def _response_echo(status_code: int, elapsed: float, headers, body=None, output_
     if body is not None:
         data["返回体"] = body
     return data
+
+
+def _websocket_url(api_base: str) -> str:
+    ws_base = _api_base(api_base).replace("http://", "ws://").replace("https://", "wss://")
+    return f"{ws_base}/ws"
+
+
+class WebSocketSession:
+    def __init__(self, api_base: str):
+        self.api_base = _api_base(api_base)
+        self.url = _websocket_url(api_base)
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.websocket = None
+        self.connected_message = None
+        self.message_count = 0
+        future = asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
+        future.result(timeout=30)
+
+    async def _connect(self):
+        import websockets
+
+        self.websocket = await websockets.connect(self.url, open_timeout=30)
+        self.connected_message = json.loads(await self.websocket.recv())
+
+    async def _send(self, payload: dict):
+        await self.websocket.send(json.dumps(payload, ensure_ascii=False))
+        while True:
+            message = json.loads(await self.websocket.recv())
+            if message.get("type") in {"stream_started"}:
+                continue
+            if message.get("type") in {"completed", "stream_completed", "error", "pong", "voices_list"}:
+                self.message_count += 1
+                return message
+
+    def send(self, payload: dict):
+        future = asyncio.run_coroutine_threadsafe(self._send(payload), self.loop)
+        return future.result(timeout=900)
+
+    async def _close(self):
+        if self.websocket is not None:
+            await self.websocket.close()
+
+    def close(self):
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._close(), self.loop)
+            future.result(timeout=10)
+        finally:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=5)
+
+
+def _close_ws_session(session_id: str | None):
+    if not session_id:
+        return
+    with WS_LOCK:
+        session = WS_SESSIONS.pop(session_id, None)
+    if session:
+        session.close()
 
 
 def build_speech_payload(
@@ -181,18 +252,15 @@ def refresh_voices(api_base):
         body = resp.json()
         choices = _voice_choices(body.get("data", []))
         value = choices[0][1] if choices else None
-        return (
-            gr.update(choices=choices, value=value),
-            gr.update(choices=choices, value=value),
-            _response_echo(resp.status_code, 0, resp.headers, body=body),
-        )
+        update = gr.update(choices=choices, value=value)
+        return update, update, update, update, _response_echo(resp.status_code, 0, resp.headers, body=body)
     except Exception as exc:
-        return gr.update(), gr.update(), {"错误": str(exc)}
+        return gr.update(), gr.update(), gr.update(), gr.update(), {"错误": str(exc)}
 
 
 def upload_voice(api_base, audio_file, speaker_name):
     if not audio_file:
-        return gr.update(), gr.update(), {"错误": "请先选择音色参考音频"}
+        return gr.update(), gr.update(), gr.update(), gr.update(), {"错误": "请先选择音色参考音频"}
 
     url = f"{_api_base(api_base)}/v1/audio/voices"
     started = time.perf_counter()
@@ -203,20 +271,22 @@ def upload_voice(api_base, audio_file, speaker_name):
     elapsed = time.perf_counter() - started
     body = resp.json() if resp.content else {}
 
-    voice_update, delete_update, voices_result = refresh_voices(api_base)
+    manage_update, http_update, ws_update, delete_update, voices_result = refresh_voices(api_base)
     voice_id = body.get("voice_id")
     if voice_id:
-        voice_update["value"] = voice_id
+        manage_update["value"] = voice_id
+        http_update["value"] = voice_id
+        ws_update["value"] = voice_id
         delete_update["value"] = voice_id
 
     result = _response_echo(resp.status_code, elapsed, resp.headers, body=body)
     result["音色列表刷新"] = voices_result
-    return voice_update, delete_update, result
+    return manage_update, http_update, ws_update, delete_update, result
 
 
 def delete_voice(api_base, voice_id):
     if not voice_id:
-        return gr.update(), gr.update(), {"错误": "请选择要删除的音色"}
+        return gr.update(), gr.update(), gr.update(), gr.update(), {"错误": "请选择要删除的音色"}
 
     url = f"{_api_base(api_base)}/v1/audio/voices/{voice_id}"
     started = time.perf_counter()
@@ -224,15 +294,23 @@ def delete_voice(api_base, voice_id):
     elapsed = time.perf_counter() - started
     body = resp.json() if resp.content else {}
 
-    voice_update, delete_update, voices_result = refresh_voices(api_base)
+    manage_update, http_update, ws_update, delete_update, voices_result = refresh_voices(api_base)
     result = _response_echo(resp.status_code, elapsed, resp.headers, body=body)
     result["音色列表刷新"] = voices_result
-    return voice_update, delete_update, result
+    return manage_update, http_update, ws_update, delete_update, result
 
 
-def synthesize_via_api(api_base, *values):
+def synthesize_via_api(api_base, api_mode, openai_model, *values):
     payload = build_speech_payload(*values)
-    url = f"{_api_base(api_base)}/v1/audio/speech"
+    if "普通接口" in api_mode:
+        url = f"{_api_base(api_base)}/tts"
+        payload = dict(payload)
+        payload["text"] = payload.pop("input")
+    else:
+        url = f"{_api_base(api_base)}/v1/audio/speech"
+        model = _optional_text(openai_model)
+        if model:
+            payload["model"] = model
     started = time.perf_counter()
     request_echo = _request_echo("POST", url, payload)
 
@@ -258,41 +336,85 @@ def synthesize_via_api(api_base, *values):
         return None, None, request_echo, {"错误": str(exc)}
 
 
-async def _websocket_call(api_base: str, payload: dict):
-    import websockets
+def ws_connect(api_base, session_id):
+    _close_ws_session(session_id)
+    request_echo = _request_echo("WS CONNECT", _websocket_url(api_base))
+    started = time.perf_counter()
+    try:
+        session = WebSocketSession(api_base)
+        session_id = uuid.uuid4().hex
+        with WS_LOCK:
+            WS_SESSIONS[session_id] = session
+        return (
+            session_id,
+            gr.update(value="已连接", interactive=False),
+            gr.update(interactive=False),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            request_echo,
+            {
+                "状态": "已连接",
+                "地址": session.url,
+                "耗时秒": round(time.perf_counter() - started, 3),
+                "服务端回显": session.connected_message,
+            },
+        )
+    except Exception as exc:
+        return (
+            None,
+            gr.update(value="未连接", interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            request_echo,
+            {"错误": str(exc)},
+        )
 
-    ws_base = _api_base(api_base).replace("http://", "ws://").replace("https://", "wss://")
-    url = f"{ws_base}/ws"
-    async with websockets.connect(url, open_timeout=30) as websocket:
-        connected = json.loads(await websocket.recv())
-        await websocket.send(json.dumps(payload, ensure_ascii=False))
-        while True:
-            message = json.loads(await websocket.recv())
-            if message.get("type") in {"completed", "stream_completed", "error"}:
-                return url, connected, message
+
+def ws_disconnect(session_id):
+    _close_ws_session(session_id)
+    return (
+        None,
+        gr.update(value="未连接", interactive=True),
+        gr.update(interactive=True),
+        gr.update(interactive=False),
+        gr.update(interactive=False),
+        _request_echo("WS CLOSE", "/ws"),
+        {"状态": "已断开"},
+    )
 
 
-def test_websocket(api_base, message_type, *values):
+def ws_send_tts(api_base, session_id, message_type, *values):
+    if not session_id:
+        raise gr.Error("请先建立 WebSocket 连接")
+    with WS_LOCK:
+        session = WS_SESSIONS.get(session_id)
+    if session is None:
+        raise gr.Error("WebSocket 会话已失效，请重新连接")
+
     payload = build_speech_payload(*values)
     payload["type"] = message_type
     payload["text"] = payload.pop("input")
     started = time.perf_counter()
-    request_echo = _request_echo("WS", f"{_api_base(api_base)}/ws", payload)
+    request_echo = _request_echo("WS SEND", session.url, payload)
 
     try:
-        ws_url, connected, message = asyncio.run(_websocket_call(api_base, payload))
+        message = session.send(payload)
         elapsed = time.perf_counter() - started
-        request_echo = _request_echo("WS", ws_url, payload)
 
         audio_path = None
+        playable_audio = None
+        response_format = message.get("format") or payload.get("response_format", "wav")
         if message.get("audio_base64"):
-            audio_path = _save_response(base64.b64decode(message["audio_base64"]), "wav", "ws_tts")
+            audio_path = _save_response(base64.b64decode(message["audio_base64"]), response_format, "ws_tts")
+            playable_audio = audio_path if response_format in ("wav", "mp3") else None
             message = {key: value for key, value in message.items() if key != "audio_base64"}
             message["audio_file"] = audio_path
 
-        return audio_path, audio_path, request_echo, {
+        return playable_audio, audio_path, request_echo, {
             "耗时秒": round(elapsed, 3),
-            "连接回显": connected,
+            "连接地址": session.url,
+            "会话消息数": session.message_count,
             "消息回显": message,
         }
     except Exception as exc:
@@ -341,7 +463,7 @@ def create_webui(get_tts):
                         speaker_name = gr.Textbox(label="音色名称", placeholder="例如：intro-01-tts")
                         upload_btn = gr.Button("上传并注册音色", variant="primary")
                     with gr.Column(scale=2):
-                        voice_dropdown = gr.Dropdown(label="已注册音色", choices=[], interactive=True)
+                        manage_voice_dropdown = gr.Dropdown(label="已注册音色", choices=[], interactive=True)
                         delete_dropdown = gr.Dropdown(label="待删除音色", choices=[], interactive=True)
                         delete_btn = gr.Button("删除选中音色", variant="stop")
                         voices_response = gr.JSON(label="音色接口回显")
@@ -354,7 +476,22 @@ def create_webui(get_tts):
                             value="这是一次 IndexTTS 二代接口测试。",
                             lines=4,
                         )
-                        response_format = gr.Radio(["wav", "mp3", "pcm"], value="wav", label="输出格式")
+                        http_voice_dropdown = gr.Dropdown(label="合成音色", choices=[], interactive=True)
+                        api_mode = gr.Radio(
+                            ["OpenAI 协议（/v1/audio/speech）", "普通接口（/tts）"],
+                            value="OpenAI 协议（/v1/audio/speech）",
+                            label="接口类型",
+                        )
+                        openai_model = gr.Textbox(
+                            label="OpenAI model（可选，不校验）",
+                            value="gpt-4o-mini-tts",
+                            placeholder="可留空；本地服务不会强制校验 model",
+                        )
+                        response_format = gr.Radio(
+                            ["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                            value="wav",
+                            label="输出格式",
+                        )
                         emo_audio_prompt = gr.Textbox(label="情感参考音频路径", placeholder="可选，填写服务端可访问路径")
 
                         with gr.Accordion("情感控制", open=False):
@@ -399,16 +536,71 @@ def create_webui(get_tts):
                         speech_response = gr.JSON(label="响应回显")
 
             with gr.Tab("WebSocket 测试"):
-                ws_type = gr.Radio(["tts", "tts_stream"], value="tts", label="消息类型")
-                ws_btn = gr.Button("发送 WebSocket 消息", variant="primary")
-                ws_audio = gr.Audio(label="WebSocket 音频", type="filepath")
-                ws_file = gr.File(label="WebSocket 输出文件")
-                ws_request = gr.Code(label="WebSocket 请求回显", language="json", lines=14)
-                ws_response = gr.JSON(label="WebSocket 响应回显")
+                ws_session = gr.State(None)
+                with gr.Row():
+                    ws_status = gr.Textbox(label="连接状态", value="未连接", interactive=False, scale=2)
+                    ws_connect_btn = gr.Button("建立连接", variant="primary", scale=1)
+                    ws_disconnect_btn = gr.Button("断开连接", variant="stop", interactive=False, scale=1)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        ws_text = gr.Textbox(
+                            label="合成文本",
+                            value="这是一次 WebSocket 会话内的连续合成测试。",
+                            lines=4,
+                        )
+                        ws_voice_dropdown = gr.Dropdown(label="合成音色", choices=[], interactive=True)
+                        ws_type = gr.Radio(["tts", "tts_stream"], value="tts", label="消息类型")
+                        ws_response_format = gr.Radio(
+                            ["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                            value="wav",
+                            label="输出格式",
+                        )
+                        ws_emo_audio_prompt = gr.Textbox(label="情感参考音频路径", placeholder="可选，填写服务端可访问路径")
+
+                        with gr.Accordion("情感控制", open=False):
+                            ws_emo_alpha = gr.Slider(0, 1, value=1.0, step=0.05, label="情感强度")
+                            ws_send_emo_vector = gr.Checkbox(label="发送 8 维情感向量", value=False)
+                            with gr.Row():
+                                ws_happy = gr.Slider(0, 1, value=0, step=0.05, label="高兴")
+                                ws_angry = gr.Slider(0, 1, value=0, step=0.05, label="愤怒")
+                                ws_sad = gr.Slider(0, 1, value=0, step=0.05, label="悲伤")
+                                ws_afraid = gr.Slider(0, 1, value=0, step=0.05, label="害怕")
+                            with gr.Row():
+                                ws_disgusted = gr.Slider(0, 1, value=0, step=0.05, label="厌恶")
+                                ws_melancholic = gr.Slider(0, 1, value=0, step=0.05, label="忧郁")
+                                ws_surprised = gr.Slider(0, 1, value=0, step=0.05, label="惊讶")
+                                ws_calm = gr.Slider(0, 1, value=0, step=0.05, label="平静")
+                            ws_use_emo_text = gr.Checkbox(label="使用文本情感识别", value=False)
+                            ws_emo_text = gr.Textbox(label="情感文本", lines=2)
+                            ws_use_random = gr.Checkbox(label="随机情感采样", value=False)
+
+                        with gr.Accordion("速度与质量", open=True):
+                            with gr.Row():
+                                ws_fast_btn = gr.Button("速度优先")
+                                ws_quality_btn = gr.Button("质量优先")
+                            ws_interval_silence = gr.Slider(0, 1000, value=200, step=10, label="分段静音毫秒")
+                            ws_max_text_tokens_per_segment = gr.Slider(20, 240, value=120, step=5, label="单段最大文本 token")
+                            ws_num_beams = gr.Slider(1, 10, value=3, step=1, label="搜索宽度")
+                            ws_do_sample = gr.Checkbox(label="启用采样", value=True)
+                            ws_top_k = gr.Slider(1, 100, value=30, step=1, label="Top-K")
+                            ws_top_p = gr.Slider(0, 1, value=0.8, step=0.01, label="Top-P")
+                            ws_temperature = gr.Slider(0.1, 2.0, value=0.8, step=0.05, label="温度")
+                            ws_max_mel_tokens = gr.Slider(100, 3000, value=1500, step=50, label="最大生成 token")
+                            ws_length_penalty = gr.Slider(0.0, 2.0, value=0.0, step=0.05, label="长度惩罚")
+                            ws_repetition_penalty = gr.Slider(0.1, 20.0, value=10.0, step=0.1, label="重复惩罚")
+                            ws_diffusion_steps = gr.Slider(1, 50, value=25, step=1, label="扩散步数")
+                            ws_inference_cfg_rate = gr.Slider(0, 2, value=0.7, step=0.05, label="CFG 强度")
+
+                    with gr.Column(scale=2):
+                        ws_send_btn = gr.Button("发送合成", variant="primary", interactive=False)
+                        ws_audio = gr.Audio(label="WebSocket 音频", type="filepath")
+                        ws_file = gr.File(label="WebSocket 输出文件")
+                        ws_request = gr.Code(label="WebSocket 请求回显", language="json", lines=14)
+                        ws_response = gr.JSON(label="WebSocket 响应回显")
 
         speech_inputs = [
             text,
-            voice_dropdown,
+            http_voice_dropdown,
             response_format,
             emo_audio_prompt,
             emo_alpha,
@@ -438,18 +630,61 @@ def create_webui(get_tts):
             inference_cfg_rate,
         ]
 
+        ws_speech_inputs = [
+            ws_text,
+            ws_voice_dropdown,
+            ws_response_format,
+            ws_emo_audio_prompt,
+            ws_emo_alpha,
+            ws_send_emo_vector,
+            ws_happy,
+            ws_angry,
+            ws_sad,
+            ws_afraid,
+            ws_disgusted,
+            ws_melancholic,
+            ws_surprised,
+            ws_calm,
+            ws_use_emo_text,
+            ws_emo_text,
+            ws_use_random,
+            ws_interval_silence,
+            ws_max_text_tokens_per_segment,
+            ws_num_beams,
+            ws_do_sample,
+            ws_top_k,
+            ws_top_p,
+            ws_temperature,
+            ws_max_mel_tokens,
+            ws_length_penalty,
+            ws_repetition_penalty,
+            ws_diffusion_steps,
+            ws_inference_cfg_rate,
+        ]
+
         health_btn.click(health_check, inputs=[api_base], outputs=[health_request, health_response])
-        refresh_btn.click(refresh_voices, inputs=[api_base], outputs=[voice_dropdown, delete_dropdown, voices_response])
-        upload_btn.click(upload_voice, inputs=[api_base, upload_audio, speaker_name], outputs=[voice_dropdown, delete_dropdown, voices_response])
-        delete_btn.click(delete_voice, inputs=[api_base, delete_dropdown], outputs=[voice_dropdown, delete_dropdown, voices_response])
+        voice_outputs = [manage_voice_dropdown, http_voice_dropdown, ws_voice_dropdown, delete_dropdown, voices_response]
+        refresh_btn.click(refresh_voices, inputs=[api_base], outputs=voice_outputs)
+        upload_btn.click(upload_voice, inputs=[api_base, upload_audio, speaker_name], outputs=voice_outputs)
+        delete_btn.click(delete_voice, inputs=[api_base, delete_dropdown], outputs=voice_outputs)
         synth_btn.click(
             synthesize_via_api,
-            inputs=[api_base] + speech_inputs,
+            inputs=[api_base, api_mode, openai_model] + speech_inputs,
             outputs=[output_audio, output_file, speech_request, speech_response],
         )
-        ws_btn.click(
-            test_websocket,
-            inputs=[api_base, ws_type] + speech_inputs,
+        ws_connect_btn.click(
+            ws_connect,
+            inputs=[api_base, ws_session],
+            outputs=[ws_session, ws_status, ws_connect_btn, ws_disconnect_btn, ws_send_btn, ws_request, ws_response],
+        )
+        ws_disconnect_btn.click(
+            ws_disconnect,
+            inputs=[ws_session],
+            outputs=[ws_session, ws_status, ws_connect_btn, ws_disconnect_btn, ws_send_btn, ws_request, ws_response],
+        )
+        ws_send_btn.click(
+            ws_send_tts,
+            inputs=[api_base, ws_session, ws_type] + ws_speech_inputs,
             outputs=[ws_audio, ws_file, ws_request, ws_response],
         )
         fast_btn.click(
@@ -482,7 +717,37 @@ def create_webui(get_tts):
                 inference_cfg_rate,
             ],
         )
-        demo.load(refresh_voices, inputs=[api_base], outputs=[voice_dropdown, delete_dropdown, voices_response])
+        ws_fast_btn.click(
+            apply_fast_preset,
+            outputs=[
+                ws_num_beams,
+                ws_do_sample,
+                ws_top_k,
+                ws_top_p,
+                ws_temperature,
+                ws_max_mel_tokens,
+                ws_length_penalty,
+                ws_repetition_penalty,
+                ws_diffusion_steps,
+                ws_inference_cfg_rate,
+            ],
+        )
+        ws_quality_btn.click(
+            apply_quality_preset,
+            outputs=[
+                ws_num_beams,
+                ws_do_sample,
+                ws_top_k,
+                ws_top_p,
+                ws_temperature,
+                ws_max_mel_tokens,
+                ws_length_penalty,
+                ws_repetition_penalty,
+                ws_diffusion_steps,
+                ws_inference_cfg_rate,
+            ],
+        )
+        demo.load(refresh_voices, inputs=[api_base], outputs=voice_outputs)
 
     return demo
 

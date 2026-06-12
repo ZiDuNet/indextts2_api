@@ -22,7 +22,7 @@ classifiers = [
 
   "Operating System :: OS Independent",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dependencies = [
   # IMPORTANT: Always run `uv lock` or `uv lock --upgrade` to resolve dependencies
   # and update the lockfile after editing anything below.
@@ -42,7 +42,7 @@ dependencies = [
   "matplotlib==3.8.2",
   "modelscope==1.27.0",
   "munch==4.0.0",
-  "numba==0.58.1",
+  "numba>=0.60.0",
   "numpy==1.26.2",
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",

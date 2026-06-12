@@ -134,12 +134,21 @@ def _unique_output_path(prefix: str = "") -> str:
 # ============== 同步推理 ==============
 
 def _do_infer(text: str, spk_audio_prompt: str, output_path: str, params: dict):
-    return tts.infer(
+    result = tts.infer(
         spk_audio_prompt=spk_audio_prompt,
         text=text,
         output_path=output_path,
         **params,
     )
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    if isinstance(result, str) and os.path.exists(result):
+        wav, sr = sf.read(result, dtype="int16")
+        return sr, wav
+    if result is None and output_path and os.path.exists(output_path):
+        wav, sr = sf.read(output_path, dtype="int16")
+        return sr, wav
+    return result
 
 
 async def _guarded_infer(text: str, spk: str, output_path: str, params: dict):

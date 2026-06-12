@@ -87,6 +87,7 @@ requires = ["hatchling >= 1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+index-url = "https://mirrors.aliyun.com/pypi/simple"
 # Disable build isolation when building DeepSpeed from source.
 # NOTE: This is *necessary* so that DeepSpeed builds directly within our `.venv`,
 # and finds our CUDA-enabled version of PyTorch, which DeepSpeed *needs* during
@@ -110,8 +111,6 @@ torchvision = [
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-# Use PyTorch built for NVIDIA Toolkit version 12.8.
-# Available versions: https://pytorch.org/get-started/locally/
-url = "https://download.pytorch.org/whl/cu128"
-# Only use this index when explicitly requested by `tool.uv.sources`.
+# PyTorch with CUDA 12.8（南京大学镜像加速）
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu128"
 explicit = true

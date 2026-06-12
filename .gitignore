@@ -29,7 +29,10 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
-
-# Example audio files (downloaded on demand, not stored in git)
 /examples/*.wav
+/assets/speaker_cache/
+/logs/
 /tests/sample_prompt.wav
+
+# Claude Code.
+.claude/

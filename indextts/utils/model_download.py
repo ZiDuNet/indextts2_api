@@ -2,7 +2,7 @@
 Model download utility that automatically switches between HuggingFace Hub and
 ModelScope based on the detected network environment.
 
-All auxiliary models are downloaded to ``{model_dir}/hf_cache/`` at startup
+All auxiliary models are downloaded to ``checkpoints/`` at startup
 via ``ensure_models_available()``, so no downloads happen during inference.
 """
 
@@ -65,7 +65,7 @@ def _download_single_file(repo_id: str, filename: str, local_path: str) -> str:
 
 def ensure_models_available(model_dir: str, bigvgan_repo: str = _BIGVGAN_REPO) -> dict:
     """
-    Download all auxiliary models to ``{model_dir}/hf_cache/`` if missing.
+    Download all auxiliary models to ``checkpoints/`` if missing.
 
     Call this once at startup before creating ``IndexTTS2``.
 
@@ -75,33 +75,38 @@ def ensure_models_available(model_dir: str, bigvgan_repo: str = _BIGVGAN_REPO) -
         - ``campplus``: path to campplus_cn_common.bin
         - ``bigvgan``: directory containing config.json + bigvgan_generator.pt
     """
-    cache_dir = os.path.join(model_dir, "hf_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    # 辅助模型直接放在 checkpoints/ 下，与主模型平级
+    ckpt_root = os.path.dirname(model_dir)  # e.g. "checkpoints/" from "checkpoints/IndexTTS-2"
+    if not ckpt_root:
+        ckpt_root = model_dir  # model_dir 本身就是 checkpoints/ 目录
+    os.makedirs(ckpt_root, exist_ok=True)
     paths = {}
 
     # 1. w2v-bert-2.0 (full repo — needed by SeamlessM4T and Wav2Vec2BertModel)
-    w2v_dir = os.path.join(cache_dir, "w2v-bert-2.0")
+    w2v_dir = os.path.join(ckpt_root, "w2v-bert-2.0")
     if not os.path.isdir(w2v_dir) or not os.listdir(w2v_dir):
         print(f">> Downloading w2v-bert-2.0 to {w2v_dir}...")
         snapshot_download("facebook/w2v-bert-2.0", local_dir=w2v_dir)
     paths["w2v_bert"] = w2v_dir
 
     # 2. MaskGCT semantic codec
-    maskgct_path = os.path.join(cache_dir, "semantic_codec_model.safetensors")
+    maskgct_dir = os.path.join(ckpt_root, "MaskGCT")
+    maskgct_path = os.path.join(maskgct_dir, "semantic_codec_model.safetensors")
     if not os.path.isfile(maskgct_path):
         print(f">> Downloading MaskGCT semantic codec to {maskgct_path}...")
         _download_single_file("amphion/MaskGCT", "semantic_codec/model.safetensors", maskgct_path)
     paths["semantic_codec"] = maskgct_path
 
     # 3. CAMPPlus speaker embedding model
-    campplus_path = os.path.join(cache_dir, "campplus_cn_common.bin")
+    campplus_dir = os.path.join(ckpt_root, "campplus")
+    campplus_path = os.path.join(campplus_dir, "campplus_cn_common.bin")
     if not os.path.isfile(campplus_path):
         print(f">> Downloading CAMPPlus to {campplus_path}...")
         _download_single_file("funasr/campplus", "campplus_cn_common.bin", campplus_path)
     paths["campplus"] = campplus_path
 
     # 4. BigVGAN vocoder (config + weights)
-    bigvgan_dir = os.path.join(cache_dir, "bigvgan")
+    bigvgan_dir = os.path.join(ckpt_root, "bigvgan")
     if not os.path.isdir(bigvgan_dir) or not os.path.isfile(os.path.join(bigvgan_dir, "config.json")):
         print(f">> Downloading BigVGAN to {bigvgan_dir}...")
         os.makedirs(bigvgan_dir, exist_ok=True)

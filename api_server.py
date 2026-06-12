@@ -1,27 +1,28 @@
 """
 IndexTTS2 API 服务器
-基于官方代码 + 自定义接口
-支持 x86 和 ARM64 (GB10)
+支持声音克隆、情感控制、音色缓存、推理参数调优
+根路由挂载 WebUI，/v1/ 路由提供 API
 """
 import os
 import sys
 import io
+import uuid
 import time
 import json
 import base64
+import hashlib
 import asyncio
 import traceback
-from typing import List, Optional, Dict, Any
+import shutil
+from typing import Optional
 from pathlib import Path
 
-# 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import soundfile as sf
 
-# FastAPI 相关
-from fastapi import FastAPI, Request, Response, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -30,56 +31,194 @@ import uvicorn
 import argparse
 from loguru import logger
 
-# 导入官方 TTS 模型
 from indextts.infer_v2 import IndexTTS2
 
 
 # ============== 全局变量 ==============
 tts: Optional[IndexTTS2] = None
 args: argparse.Namespace = None
+SPEAKER_CACHE_DIR = "assets/speaker_cache"
+SPEAKER_META_FILE = os.path.join(SPEAKER_CACHE_DIR, "meta.json")
+
+# 并发控制：GPU 推理信号量（同时只允许一个推理任务，请求排队）
+_gpu_semaphore: Optional[asyncio.Semaphore] = None
+# 音色元数据内存缓存
+_meta_cache: Optional[dict] = None
+
+
+# ============== 音色缓存管理 ==============
+
+def _load_meta() -> dict:
+    global _meta_cache
+    if _meta_cache is not None:
+        return _meta_cache
+    if os.path.exists(SPEAKER_META_FILE):
+        with open(SPEAKER_META_FILE, "r", encoding="utf-8") as f:
+            _meta_cache = json.load(f)
+            return _meta_cache
+    _meta_cache = {}
+    return _meta_cache
+
+
+def _save_meta(meta: dict):
+    global _meta_cache
+    _meta_cache = meta
+    os.makedirs(SPEAKER_CACHE_DIR, exist_ok=True)
+    with open(SPEAKER_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _md5_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ============== 推理参数提取 ==============
+
+def _extract_params(data: dict) -> dict:
+    """从请求体中提取推理参数，返回 infer() 需要的 kwargs"""
+    params = {}
+    for key in ("emo_audio_prompt", "emo_alpha", "emo_vector", "use_emo_text",
+                "emo_text", "use_random"):
+        if key in data:
+            params[key] = data[key]
+    if "emo_alpha" not in params:
+        params["emo_alpha"] = 1.0
+    if "emo_vector" in params:
+        v = params["emo_vector"]
+        if not isinstance(v, list) or len(v) != 8:
+            raise ValueError("emo_vector 必须是长度为 8 的数组 [高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静]")
+        params["emo_vector"] = [float(x) for x in v]
+    for key in ("interval_silence", "max_text_tokens_per_segment"):
+        if key in data:
+            params[key] = data[key]
+    for key in ("num_beams", "do_sample", "top_k", "top_p", "temperature",
+                "max_mel_tokens", "length_penalty", "repetition_penalty"):
+        if key in data:
+            params[key] = data[key]
+    return params
+
+
+def _encode_audio(wav: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
+    buf = io.BytesIO()
+    if fmt == "mp3":
+        sf.write(buf, wav, sr, format="MP3")
+        return buf.getvalue(), "audio/mpeg"
+    elif fmt == "pcm":
+        return wav.tobytes(), "audio/pcm"
+    else:
+        sf.write(buf, wav, sr, format="WAV")
+        return buf.getvalue(), "audio/wav"
+
+
+def _resolve_speaker(data: dict) -> Optional[str]:
+    """解析音色：支持 voice_id（缓存）或 spk_audio_prompt（文件路径）"""
+    speaker_id = data.get("speaker_id") or data.get("voice")
+    if speaker_id:
+        meta = _load_meta()
+        if speaker_id in meta:
+            return meta[speaker_id]["audio_path"]
+        return speaker_id
+    return data.get("spk_audio_prompt")
+
+
+def _unique_output_path(prefix: str = "") -> str:
+    """生成唯一的输出文件路径（UUID 防并发冲突）"""
+    name = f"{prefix}{uuid.uuid4().hex[:8]}" if prefix else uuid.uuid4().hex[:12]
+    return f"outputs/{name}.wav"
+
+
+# ============== 同步推理 ==============
+
+def _do_infer(text: str, spk_audio_prompt: str, output_path: str, params: dict):
+    return tts.infer(
+        spk_audio_prompt=spk_audio_prompt,
+        text=text,
+        output_path=output_path,
+        **params,
+    )
+
+
+async def _guarded_infer(text: str, spk: str, output_path: str, params: dict):
+    """带信号量保护的推理，控制 GPU 并发"""
+    async with _gpu_semaphore:
+        return await asyncio.to_thread(_do_infer, text, spk, output_path, params)
 
 
 # ============== WebSocket 管理 ==============
+
 class ConnectionManager:
-    """WebSocket 连接管理器"""
-
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active_connections.append(ws)
         logger.info(f"WebSocket 连接数: {len(self.active_connections)}")
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active_connections:
+            self.active_connections.remove(ws)
             logger.info(f"WebSocket 连接数: {len(self.active_connections)}")
 
-    async def send_json(self, message: dict, websocket: WebSocket):
+    async def send_json(self, message: dict, ws: WebSocket):
         try:
-            await websocket.send_json(message)
+            await ws.send_json(message)
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
-
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except:
-                pass
 
 
 manager = ConnectionManager()
 
 
+# ============== 主模型自动下载 ==============
+
+def _ensure_main_model(model_dir: str):
+    """如果主模型不存在，从 ModelScope 自动下载（缓存到 H 盘避免 C 盘空间不足）"""
+    cfg_path = os.path.join(model_dir, "config.yaml")
+    if os.path.exists(cfg_path):
+        return
+
+    logger.info(f"主模型不存在，从 ModelScope 下载到 {model_dir} ...")
+    ms_cache = os.environ.get("MODELSCOPE_CACHE", "H:/modelscope_cache")
+    os.makedirs(ms_cache, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    try:
+        from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot
+        ms_snapshot(model_id="IndexTeam/IndexTTS-2", cache_dir=ms_cache)
+
+        # 从缓存目录复制到 model_dir
+        src_dir = os.path.join(ms_cache, "IndexTeam", "IndexTTS-2")
+        if not os.path.isdir(src_dir):
+            for root, dirs, files in os.walk(ms_cache):
+                if "config.yaml" in files:
+                    src_dir = root
+                    break
+        if os.path.isdir(src_dir):
+            for item in os.listdir(src_dir):
+                src = os.path.join(src_dir, item)
+                dst = os.path.join(model_dir, item)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+            logger.info(f"主模型下载完成: {model_dir}")
+    except Exception as e:
+        logger.error(f"主模型下载失败: {e}")
+
+
 # ============== 应用生命周期 ==============
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动和关闭生命周期"""
-    global tts
+    global tts, _gpu_semaphore
+    _gpu_semaphore = asyncio.Semaphore(1)
 
-    # 启动时初始化
+    # 自动下载主模型（缓存到 H 盘）
+    _ensure_main_model(args.model_dir)
+
     logger.info("Initializing IndexTTS2...")
 
     try:
@@ -90,37 +229,28 @@ async def lifespan(app: FastAPI):
             use_fp16=args.fp16,
             device=device,
             use_cuda_kernel=False,
-            use_torch_compile=False
+            use_torch_compile=False,
         )
-
-        # 预加载角色
-        speaker_path = "assets/speaker.json"
-        if os.path.exists(speaker_path):
-            with open(speaker_path, 'r', encoding='utf-8') as f:
-                speaker_dict = json.load(f)
-            for speaker, audio_paths in speaker_dict.items():
-                tts.registry_speaker(speaker, audio_paths)
-            logger.info(f"Loaded {len(speaker_dict)} speakers")
-
         logger.info("IndexTTS2 initialized successfully")
-
     except Exception as e:
-        logger.warning(f"模型初始化失败，将以有限功能运行: {str(e)}")
-        logger.warning("请确保已安装正确的 Python 版本 (3.10-3.11) 并下载模型文件")
+        logger.warning(f"模型初始化失败，将以有限功能运行: {e}")
         tts = None
 
-    yield
+    # 加载音色缓存到内存
+    _load_meta()
+    logger.info(f"已加载 {len(_meta_cache or {})} 个音色")
 
-    # 关闭时清理
+    yield
     logger.info("Shutting down...")
 
 
 # ============== FastAPI 应用 ==============
+
 app = FastAPI(
     lifespan=lifespan,
     title="IndexTTS2 API",
-    version="2.0",
-    description="IndexTTS2 零样本语音合成 API - 支持声音克隆和情感控制"
+    version="2.1",
+    description="IndexTTS2 零样本语音合成 API — 声音克隆 · 情感控制 · 音色缓存 · 推理参数调优",
 )
 
 app.add_middleware(
@@ -128,374 +258,184 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-# 日志配置
 logger.add("logs/api.log", rotation="10 MB", retention=10, level="DEBUG", enqueue=True)
 
 
-# ============== 基础接口 ==============
+# ============== 健康检查 ==============
 
-@app.get("/health")
+@app.get("/health", tags=["基础"])
 async def health_check():
     """健康检查"""
     if tts is None:
-        return JSONResponse(status_code=200, content={
-            "status": "partial",
-            "model_loaded": False,
-            "message": "API 服务运行中，但模型未初始化（需要 Python 3.10-3.11）"
-        })
-    return JSONResponse(status_code=200, content={
-        "status": "healthy",
-        "model_loaded": True,
-        "timestamp": time.time(),
-        "device": tts.device if tts else "unknown"
-    })
+        return {"status": "partial", "model_loaded": False,
+                "message": "模型未初始化"}
+    return {"status": "healthy", "model_loaded": True,
+            "timestamp": time.time(), "device": str(tts.device)}
 
 
-# ============== 角色管理接口 ==============
+# ============== 音色管理 (/v1/audio/voices) ==============
 
-@app.post("/register_speaker")
-async def register_speaker(request: Request):
-    """注册角色"""
-    try:
-        data = await request.json()
-        name = data.get("name")
-        sample_audios = data.get("sample_audios", [])
-
-        if not name or not sample_audios:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "name 和 sample_audios 必须"}
-            )
-
-        # 保存到 speaker.json
-        speaker_path = "assets/speaker.json"
-        os.makedirs("assets", exist_ok=True)
-
-        speaker_dict = {}
-        if os.path.exists(speaker_path):
-            with open(speaker_path, 'r', encoding='utf-8') as f:
-                speaker_dict = json.load(f)
-
-        speaker_dict[name] = sample_audios
-        with open(speaker_path, 'w', encoding='utf-8') as f:
-            json.dump(speaker_dict, f, ensure_ascii=False, indent=2)
-
-        # 注册到模型（如果模型已初始化）
-        if tts is not None:
-            tts.registry_speaker(name, sample_audios)
-
-        return JSONResponse(content={
-            "status": "success",
-            "message": f"角色 {name} 注册成功"
-        })
-
-    except Exception as e:
-        logger.error(f"注册角色失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.get("/audio/voices")
-async def get_voices():
-    """获取已注册角色列表"""
-    speaker_path = "assets/speaker.json"
-    if os.path.exists(speaker_path):
-        with open(speaker_path, 'r', encoding='utf-8') as f:
-            return JSONResponse(content={"registered_voices": json.load(f)})
-    return JSONResponse(content={"registered_voices": {}})
-
-
-@app.post("/update_speaker")
-async def update_speaker(request: Request):
-    """修改角色"""
-    try:
-        data = await request.json()
-        name = data.get("name")
-        sample_audios = data.get("sample_audios", [])
-        speaker_path = "assets/speaker.json"
-
-        if not os.path.exists(speaker_path):
-            return JSONResponse(status_code=404, content={"error": "speaker.json 不存在"})
-
-        with open(speaker_path, 'r', encoding='utf-8') as f:
-            speaker_dict = json.load(f)
-
-        if name not in speaker_dict:
-            return JSONResponse(status_code=404, content={"error": f"角色 {name} 不存在"})
-
-        speaker_dict[name] = sample_audios
-        with open(speaker_path, 'w', encoding='utf-8') as f:
-            json.dump(speaker_dict, f, ensure_ascii=False, indent=2)
-
-        # 重新注册（如果模型已初始化）
-        if tts is not None:
-            if hasattr(tts, 'speaker_embeds') and name in tts.speaker_embeds:
-                del tts.speaker_embeds[name]
-            tts.registry_speaker(name, sample_audios)
-
-        return JSONResponse(content={
-            "status": "success",
-            "message": f"角色 {name} 修改成功"
-        })
-
-    except Exception as e:
-        logger.error(f"修改角色失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/delete_speaker")
-async def delete_speaker(request: Request):
-    """删除角色"""
-    try:
-        data = await request.json()
-        name = data.get("name")
-        speaker_path = "assets/speaker.json"
-
-        if not os.path.exists(speaker_path):
-            return JSONResponse(status_code=404, content={"error": "speaker.json 不存在"})
-
-        with open(speaker_path, 'r', encoding='utf-8') as f:
-            speaker_dict = json.load(f)
-
-        if name not in speaker_dict:
-            return JSONResponse(status_code=404, content={"error": f"角色 {name} 不存在"})
-
-        del speaker_dict[name]
-        with open(speaker_path, 'w', encoding='utf-8') as f:
-            json.dump(speaker_dict, f, ensure_ascii=False, indent=2)
-
-        # 清除缓存
-        if hasattr(tts, 'speaker_embeds') and name in tts.speaker_embeds:
-            del tts.speaker_embeds[name]
-
-        return JSONResponse(content={
-            "status": "success",
-            "message": f"角色 {name} 删除成功"
-        })
-
-    except Exception as e:
-        logger.error(f"删除角色失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ============== 文件上传 ==============
-
-@app.post("/upload_audio")
-async def upload_audio(file: UploadFile = File(...)):
-    """音频文件上传"""
-    try:
-        ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}
-        ext = os.path.splitext(file.filename)[-1].lower()
-
-        if ext not in ALLOWED_EXTENSIONS:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"不支持的后缀: {ext}"}
-            )
-
-        os.makedirs("assets", exist_ok=True)
-        filename = f"{int(time.time())}_{file.filename}"
-        path = f"assets/{filename}"
-
-        with open(path, "wb") as f:
-            f.write(await file.read())
-
-        return JSONResponse(content={
-            "status": "success",
-            "file_path": path
-        })
-
-    except Exception as e:
-        logger.error(f"上传失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ============== TTS 合成接口 ==============
-
-@app.post("/tts")
-async def tts_api(request: Request):
-    """语音合成 (二进制流)"""
+@app.post("/v1/audio/voices", tags=["音色管理"])
+async def upload_speaker(
+    audio: UploadFile = File(..., description="音色参考音频（3-10秒最佳）"),
+    speaker_name: str = Form("", description="音色名称（可选）"),
+):
+    """上传音频并注册音色，返回 voice_id 用于后续合成。"""
     if tts is None:
-        return JSONResponse(status_code=503, content={
-            "error": "模型未初始化",
-            "message": "请使用 Python 3.10-3.11 并正确配置模型"
+        return JSONResponse(status_code=503, content={"error": "模型未初始化"})
+
+    try:
+        if not audio.filename:
+            return JSONResponse(status_code=400, content={"error": "请提供音频文件"})
+
+        ext = os.path.splitext(audio.filename)[-1].lower()
+        if ext not in {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}:
+            return JSONResponse(status_code=400, content={"error": f"不支持的格式: {ext}，支持: mp3, wav, m4a, flac, ogg, aac"})
+
+        audio_bytes = await audio.read()
+        if len(audio_bytes) < 1024:
+            return JSONResponse(status_code=400, content={"error": "音频文件过小，请上传 3-10 秒的参考音频"})
+        if len(audio_bytes) > 20 * 1024 * 1024:
+            return JSONResponse(status_code=400, content={"error": "音频文件过大（超过 20MB），请压缩后上传"})
+
+        os.makedirs(SPEAKER_CACHE_DIR, exist_ok=True)
+        tmp_path = os.path.join(SPEAKER_CACHE_DIR, f"tmp_{uuid.uuid4().hex[:8]}{ext}")
+        with open(tmp_path, "wb") as f:
+            f.write(audio_bytes)
+
+        md5 = _md5_file(tmp_path)
+        voice_id = f"spk_{md5[:8]}"
+
+        meta = _load_meta()
+        if voice_id in meta:
+            os.remove(tmp_path)
+            return {"voice_id": voice_id, "status": "exists", "message": "该音频已注册"}
+
+        final_path = os.path.join(SPEAKER_CACHE_DIR, f"{voice_id}{ext}")
+        os.rename(tmp_path, final_path)
+
+        # 预热：通过一次短推理缓存 speaker embedding
+        try:
+            warmup_path = _unique_output_path("warmup_")
+            os.makedirs("outputs", exist_ok=True)
+            await _guarded_infer("测试", final_path, warmup_path, {})
+            if os.path.exists(warmup_path):
+                os.remove(warmup_path)
+        except Exception as warmup_err:
+            logger.warning(f"音色预热失败（不影响使用）: {warmup_err}")
+
+        meta[voice_id] = {
+            "voice_name": speaker_name or voice_id,
+            "audio_path": final_path,
+            "md5": md5,
+            "original_filename": audio.filename,
+            "created_at": time.time(),
+            "embedding_cached": True,
+        }
+        _save_meta(meta)
+
+        logger.info(f"音色注册成功: {voice_id} ({speaker_name})")
+        return {"voice_id": voice_id, "md5": md5, "status": "new",
+                "message": "音色注册成功，可使用 /v1/audio/speech 的 voice 参数合成语音"}
+
+    except Exception as e:
+        logger.error(f"上传音色失败: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/v1/audio/voices", tags=["音色管理"])
+async def list_speakers():
+    """获取所有已注册的音色列表"""
+    meta = _load_meta()
+    voices = []
+    for vid, info in meta.items():
+        voices.append({
+            "voice_id": vid,
+            "name": info.get("voice_name", ""),
+            "original_filename": info.get("original_filename", ""),
+            "created_at": info.get("created_at"),
         })
+    return {"object": "list", "data": voices}
+
+
+@app.delete("/v1/audio/voices/{voice_id}", tags=["音色管理"])
+async def delete_speaker(voice_id: str):
+    """删除指定音色"""
+    meta = _load_meta()
+    if voice_id not in meta:
+        return JSONResponse(status_code=404, content={"error": f"音色 {voice_id} 不存在"})
+
+    info = meta.pop(voice_id)
+    _save_meta(meta)
+
+    audio_path = info.get("audio_path", "")
+    if audio_path and os.path.exists(audio_path):
+        os.remove(audio_path)
+
+    logger.info(f"音色已删除: {voice_id}")
+    return {"status": "deleted", "voice_id": voice_id}
+
+
+# ============== 语音合成 (/v1/audio/speech) ==============
+
+@app.post("/v1/audio/speech", tags=["语音合成"])
+async def openai_speech(request: Request):
+    """语音合成（OpenAI Speech API 规范）。"""
+    if tts is None:
+        return JSONResponse(status_code=503, content={"error": "模型未初始化"})
 
     try:
         data = await request.json()
-        text = data.get("text", "")
-        spk_audio_prompt = data.get("spk_audio_prompt", data.get("voice"))
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是有效 JSON"})
 
-        emo_audio_prompt = data.get("emo_audio_prompt")
-        emo_alpha = data.get("emo_alpha", 1.0)
-        emo_vector = data.get("emo_vector")
-        use_emo_text = data.get("use_emo_text", False)
-        emo_text = data.get("emo_text")
+    text = data.get("input", "")
+    if not text or not isinstance(text, str) or not text.strip():
+        return JSONResponse(status_code=400, content={"error": "input 为必需参数，且不能为空"})
 
-        if not text or not spk_audio_prompt:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "text 和 spk_audio_prompt 必须"}
-            )
+    try:
+        params = _extract_params(data)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
-        output_path = f"outputs/{int(time.time())}.wav"
+    voice = data.get("voice", "")
+    meta = _load_meta()
+    spk_audio_prompt = meta.get(voice, {}).get("audio_path", voice) if voice else "examples/voice_01.wav"
+
+    if not os.path.exists(spk_audio_prompt):
+        return JSONResponse(status_code=400, content={"error": f"音色文件不存在: {voice}，请先通过 /v1/audio/voices 上传"})
+
+    output_format = data.get("response_format", "wav")
+    if output_format not in ("wav", "mp3", "pcm"):
+        return JSONResponse(status_code=400, content={"error": f"不支持的格式: {output_format}，可选: wav, mp3, pcm"})
+
+    try:
+        output_path = _unique_output_path()
         os.makedirs("outputs", exist_ok=True)
 
-        sr, wav = tts.infer(
-            spk_audio_prompt=spk_audio_prompt,
-            text=text,
-            output_path=output_path,
-            emo_audio_prompt=emo_audio_prompt,
-            emo_alpha=emo_alpha,
-            emo_vector=emo_vector,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text
-        )
+        start = time.perf_counter()
+        result = await _guarded_infer(text.strip(), spk_audio_prompt, output_path, params)
+        elapsed = time.perf_counter() - start
 
-        return Response(content=wav.tobytes(), media_type="application/octet-stream")
+        if result is None:
+            return JSONResponse(status_code=500, content={"error": "合成失败，模型返回空结果"})
+
+        sr, wav = result
+        logger.info(f"TTS 完成: {len(text)}字, {elapsed:.2f}s, 格式: {output_format}")
+
+        audio_bytes, media_type = _encode_audio(wav, sr, output_format)
+        return Response(content=audio_bytes, media_type=media_type)
 
     except Exception as e:
         logger.error(f"TTS 失败: {e}")
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": f"合成失败: {str(e)}"})
 
 
-@app.post("/tts-wav")
-async def tts_wav(request: Request):
-    """语音合成 (WAV格式)"""
-    if tts is None:
-        return JSONResponse(status_code=503, content={
-            "error": "模型未初始化",
-            "message": "请使用 Python 3.10-3.11 并正确配置模型"
-        })
-
-    try:
-        data = await request.json()
-        text = data.get("text", "")
-        spk_audio_prompt = data.get("spk_audio_prompt", data.get("voice"))
-
-        emo_audio_prompt = data.get("emo_audio_prompt")
-        emo_alpha = data.get("emo_alpha", 1.0)
-        emo_vector = data.get("emo_vector")
-        use_emo_text = data.get("use_emo_text", False)
-        emo_text = data.get("emo_text")
-
-        if not text or not spk_audio_prompt:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "text 和 spk_audio_prompt 必须"}
-            )
-
-        output_path = f"outputs/{int(time.time())}.wav"
-        os.makedirs("outputs", exist_ok=True)
-
-        sr, wav = tts.infer(
-            spk_audio_prompt=spk_audio_prompt,
-            text=text,
-            output_path=output_path,
-            emo_audio_prompt=emo_audio_prompt,
-            emo_alpha=emo_alpha,
-            emo_vector=emo_vector,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text
-        )
-
-        # 写入 WAV
-        with io.BytesIO() as buf:
-            sf.write(buf, wav, sr, format='WAV')
-            wav_bytes = buf.getvalue()
-
-        return Response(content=wav_bytes, media_type="audio/wav")
-
-    except Exception as e:
-        logger.error(f"TTS 失败: {e}")
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/tts_url")
-async def tts_url(request: Request):
-    """使用音频路径合成"""
-    if tts is None:
-        return JSONResponse(status_code=503, content={
-            "error": "模型未初始化",
-            "message": "请使用 Python 3.10-3.11 并正确配置模型"
-        })
-
-    try:
-        data = await request.json()
-        text = data.get("text", "")
-        audio_paths = data.get("audio_paths", [])
-
-        if not text:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "text 必须"}
-            )
-
-        output_path = f"outputs/{int(time.time())}.wav"
-        os.makedirs("outputs", exist_ok=True)
-
-        sr, wav = tts.infer(
-            spk_audio_prompt=audio_paths[0] if audio_paths else "examples/voice_01.wav",
-            text=text,
-            output_path=output_path
-        )
-
-        with io.BytesIO() as buf:
-            sf.write(buf, wav, sr, format='WAV')
-            wav_bytes = buf.getvalue()
-
-        return Response(content=wav_bytes, media_type="audio/wav")
-
-    except Exception as e:
-        logger.error(f"TTS 失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/audio/speech")
-async def openai_compat(request: Request):
-    """OpenAI 兼容接口"""
-    if tts is None:
-        return JSONResponse(status_code=503, content={
-            "error": "模型未初始化",
-            "message": "请使用 Python 3.10-3.11 并正确配置模型"
-        })
-
-    try:
-        data = await request.json()
-        text = data.get("input", "")
-        voice = data.get("voice", "examples/voice_01.wav")
-
-        if not text:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "input 必须"}
-            )
-
-        output_path = f"outputs/{int(time.time())}.wav"
-        os.makedirs("outputs", exist_ok=True)
-
-        sr, wav = tts.infer(
-            spk_audio_prompt=voice,
-            text=text,
-            output_path=output_path
-        )
-
-        with io.BytesIO() as buf:
-            sf.write(buf, wav, sr, format='WAV')
-            wav_bytes = buf.getvalue()
-
-        return Response(content=wav_bytes, media_type="audio/wav")
-
-    except Exception as e:
-        logger.error(f"TTS 失败: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ============== WebSocket 接口 ==============
+# ============== WebSocket ==============
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -506,70 +446,73 @@ async def websocket_endpoint(ws: WebSocket):
 
         while True:
             data = await ws.receive_json()
-            await handle_ws_message(data, ws)
+            msg_type = data.get("type")
+
+            try:
+                if msg_type in ("tts", "tts_stream"):
+                    if tts is None:
+                        await manager.send_json({"type": "error", "message": "模型未初始化"}, ws)
+                        continue
+
+                    text = data.get("text", "")
+                    if not text or not text.strip():
+                        await manager.send_json({"type": "error", "message": "text 不能为空"}, ws)
+                        continue
+
+                    try:
+                        params = _extract_params(data)
+                    except ValueError as e:
+                        await manager.send_json({"type": "error", "message": str(e)}, ws)
+                        continue
+
+                    spk = _resolve_speaker(data) or "examples/voice_01.wav"
+
+                    if msg_type == "tts_stream":
+                        await manager.send_json({"type": "stream_started"}, ws)
+
+                    output_path = _unique_output_path("ws_")
+                    result = await _guarded_infer(text, spk, output_path, params)
+
+                    if result:
+                        sr, wav = result
+                        with io.BytesIO() as buf:
+                            sf.write(buf, wav, sr, format="WAV")
+                            wav_bytes = buf.getvalue()
+
+                        await manager.send_json({
+                            "type": "stream_completed" if msg_type == "tts_stream" else "completed",
+                            "audio_base64": base64.b64encode(wav_bytes).decode(),
+                            "sample_rate": sr,
+                        }, ws)
+                    else:
+                        await manager.send_json({"type": "error", "message": "合成失败"}, ws)
+
+                elif msg_type == "ping":
+                    await manager.send_json({"type": "pong"}, ws)
+
+                elif msg_type == "get_voices":
+                    await manager.send_json({"type": "voices_list", "voices": _load_meta()}, ws)
+
+            except Exception as e:
+                logger.error(f"WebSocket 消息处理失败: {e}")
+                await manager.send_json({"type": "error", "message": str(e)}, ws)
 
     except WebSocketDisconnect:
         manager.disconnect(ws)
 
 
-async def handle_ws_message(data: dict, ws: WebSocket):
-    """处理 WebSocket 消息"""
-    msg_type = data.get("type")
+# ============== 挂载 WebUI 到根路由 ==============
 
-    try:
-        if msg_type == "tts":
-            text = data.get("text", "")
-            spk_audio_prompt = data.get("spk_audio_prompt", data.get("voice", "examples/voice_01.wav"))
+import gradio as gr
+from webui_enhanced import create_webui
 
-            output_path = f"outputs/ws_{int(time.time())}.wav"
-            sr, wav = tts.infer(
-                spk_audio_prompt=spk_audio_prompt,
-                text=text,
-                output_path=output_path
-            )
 
-            with io.BytesIO() as buf:
-                sf.write(buf, wav, sr, format='WAV')
-                wav_bytes = buf.getvalue()
+def _get_tts():
+    return tts
 
-            await manager.send_json({
-                "type": "completed",
-                "audio_base64": base64.b64encode(wav_bytes).decode(),
-                "sample_rate": sr
-            }, ws)
 
-        elif msg_type == "ping":
-            await manager.send_json({"type": "pong"}, ws)
-
-        elif msg_type == "get_voices":
-            speaker_path = "assets/speaker.json"
-            voices = {}
-            if os.path.exists(speaker_path):
-                with open(speaker_path, 'r', encoding='utf-8') as f:
-                    voices = json.load(f)
-            await manager.send_json({"type": "voices_list", "voices": voices}, ws)
-
-        elif msg_type == "tts_stream":
-            text = data.get("text", "")
-            spk = data.get("character", data.get("voice", "examples/voice_01.wav"))
-
-            await manager.send_json({"type": "stream_started"}, ws)
-
-            output_path = f"outputs/ws_{int(time.time())}.wav"
-            sr, wav = tts.infer(spk_audio_prompt=spk, text=text, output_path=output_path)
-
-            with io.BytesIO() as buf:
-                sf.write(buf, wav, sr, format='WAV')
-                wav_bytes = buf.getvalue()
-
-            await manager.send_json({
-                "type": "stream_completed",
-                "audio_base64": base64.b64encode(wav_bytes).decode()
-            }, ws)
-
-    except Exception as e:
-        logger.error(f"WebSocket 处理失败: {e}")
-        await manager.send_json({"type": "error", "message": str(e)}, ws)
+gradio_app = create_webui(_get_tts)
+app = gr.mount_gradio_app(app, gradio_app, path="/")
 
 
 # ============== 主程序 ==============
@@ -578,17 +521,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IndexTTS2 API Server")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8002, help="监听端口")
-    parser.add_argument("--model_dir", type=str, default="checkpoints", help="模型目录")
+    parser.add_argument("--model_dir", type=str, default="checkpoints/IndexTTS-2", help="模型目录")
     parser.add_argument("--device", type=str, default="auto", help="设备 (auto/cuda/cpu)")
     parser.add_argument("--fp16", action="store_true", help="使用 FP16")
     args = parser.parse_args()
 
-    # 确保输出目录存在
     os.makedirs("outputs", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
-    os.makedirs("assets", exist_ok=True)
+    os.makedirs(SPEAKER_CACHE_DIR, exist_ok=True)
 
     logger.info(f"IndexTTS2 API Server - http://{args.host}:{args.port}")
+    logger.info(f"  WebUI: http://{args.host}:{args.port}/")
+    logger.info(f"  API:   http://{args.host}:{args.port}/docs")
     logger.info(f"Device: {args.device}, FP16: {args.fp16}")
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, workers=1)

@@ -36,8 +36,7 @@ def need_proxy(timeout: float = 3.0) -> bool:
 
     Detection methods (in order):
     1. Check environment variable ``USE_MODELSCOPE`` for manual override
-    2. Try TCP connection to huggingface.co (if unreachable, need proxy)
-    3. Compare latency between modelscope.cn and huggingface.co
+    2. Default to ModelScope (USE_MODELSCOPE=true)
 
     The result is cached after the first call so subsequent calls are instant.
     """
@@ -47,32 +46,12 @@ def need_proxy(timeout: float = 3.0) -> bool:
 
     # Allow manual override via environment variable
     env_override = os.environ.get("USE_MODELSCOPE", "").lower()
-    if env_override == "true":
-        logger.info("Network detection: forced to proxy mode (USE_MODELSCOPE=true)")
-        _detection_cache = True
-        return True
     if env_override == "false":
         logger.info("Network detection: forced to direct mode (USE_MODELSCOPE=false)")
         _detection_cache = False
         return False
 
-    # Check if huggingface.co is accessible and measure latency
-    hf_latency = _tcp_latency("huggingface.co", timeout=timeout)
-    if hf_latency is None:
-        logger.info("Network detection: huggingface.co is unreachable, need proxy")
-        _detection_cache = True
-        return True
-
-    # Compare: if modelscope is significantly faster, likely in China
-    ms_latency = _tcp_latency("modelscope.cn", timeout=timeout)
-    if ms_latency is not None and ms_latency < hf_latency * 0.5:
-        logger.info(
-            f"Network detection: modelscope.cn ({ms_latency:.2f}s) is significantly "
-            f"faster than huggingface.co ({hf_latency:.2f}s), need proxy"
-        )
-        _detection_cache = True
-        return True
-
-    logger.info("Network detection: huggingface.co is accessible, direct mode")
-    _detection_cache = False
-    return False
+    # Default to ModelScope
+    logger.info("Network detection: using ModelScope as primary source")
+    _detection_cache = True
+    return True

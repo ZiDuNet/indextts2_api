@@ -1,121 +1,64 @@
-# IndexTTS2 快速开始指南
+# IndexTTS2 快速开始
 
-## 项目位置
-```
-C:\Users\wushuo\Desktop\indextts\index-tts-vllm\
-```
+## 环境要求
 
-## 当前状态
+- Python 3.10–3.14
+- NVIDIA GPU + CUDA 12.8+
+- [uv 包管理器](https://docs.astral.sh/uv/)
 
-### ✅ 已完成
-- API 服务器代码 (简化版可测试)
-- x86 和 ARM64/GB10 Docker 配置
-- 你的音频文件 (examples/voice_01.wav)
-
-### ❌ 需要你完成
-- Python 3.11 安装
-- 模型下载
-
----
-
-## 快速开始
-
-### 方式 1: Python 直接启动 (推荐)
+## 安装
 
 ```bash
-# 1. 安装 Python 3.11
-# 下载: https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
-
-# 2. 进入项目目录
-cd C:\Users\wushuo\Desktop\indextts\index-tts-vllm
-
-# 3. 创建虚拟环境
-python3.11 -m venv venv
-
-# 4. 激活并安装依赖
-venv\Scripts\activate
-pip install uv
+# 安装依赖
 uv sync --all-extras
 
-# 5. 启动服务器 (会自动从 ModelScope 下载模型)
-python api_server.py --fp16
-
-# 6. 测试接口
-# 打开浏览器: http://localhost:8002/health
+# 中国镜像加速
+uv sync --all-extras --default-index "https://mirrors.aliyun.com/pypi/simple"
 ```
 
-### 方式 2: Docker
+## 启动
 
 ```bash
-# 1. 安装 Docker Desktop
-# https://www.docker.com/products/docker-desktop/
-
-# 2. 构建镜像
-cd C:\Users\wushuo\Desktop\indextts\index-tts-vllm
-docker build -t indextts2 .
-
-# 3. 运行
-docker run --gpus all -p 8002:8002 indextts2
+# API 服务器（端口 8002），首次启动自动下载模型
+uv run python api_server.py --host 0.0.0.0 --port 8002 --fp16
 ```
 
-### 方式 3: 简化版 (立即可用，但只用模拟音频)
+启动后：
+- **WebUI**：http://localhost:8002/
+- **API 文档**：http://localhost:8002/docs
+
+## 测试
 
 ```bash
-cd C:\Users\wushuo\Desktop\indextts\index-tts-vllm
-python api_server_simple.py
-```
-
----
-
-## 接口列表
-
-| 接口 | 方法 | 功能 |
-|------|------|------|
-| `/health` | GET | 健康检查 |
-| `/register_speaker` | POST | 注册角色 |
-| `/audio/voices` | GET | 获取角色列表 |
-| `/update_speaker` | POST | 修改角色 |
-| `/delete_speaker` | POST | 删除角色 |
-| `/upload_audio` | POST | 文件上传 |
-| `/tts` | POST | 语音合成(二进制) |
-| `/tts-wav` | POST | 语音合成(WAV) |
-| `/tts_url` | POST | URL合成 |
-| `/audio/speech` | POST | OpenAI兼容 |
-| `/ws` | WebSocket | 流式合成 |
-
----
-
-## 测试命令
-
-```bash
-# 测试健康
+# 健康检查
 curl http://localhost:8002/health
 
-# 测试 TTS
-curl -X POST http://localhost:8002/tts-wav \
+# 上传音色
+curl -X POST http://localhost:8002/v1/audio/voices \
+  -F "audio=@examples/voice_01.wav" \
+  -F "speaker_name=测试"
+
+# 语音合成
+curl -X POST http://localhost:8002/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"text": "你好", "spk_audio_prompt": "examples/voice_01.wav"}' \
+  -d '{"input":"你好世界","voice":"spk_xxxxxxxx"}' \
   -o test.wav
 ```
 
----
+详细 API 文档见 [README_API.md](README_API.md)。
 
-## 问题排查
+## 其他启动方式
 
-1. **Python 版本错误**: 确保使用 Python 3.11
-2. **模型下载慢**: 首次运行会自动从 ModelScope 下载 (~2GB)
-3. **CUDA 错误**: 确保有 NVIDIA GPU 和驱动
+```bash
+# 官方 WebUI（端口 7860）
+uv run webui.py --fp16
 
----
+# 增强版 WebUI 独立运行（含情感控制 + 推理参数调优）
+uv run python webui_enhanced.py --use_fp16
+```
 
-## 文件说明
+## 常见问题
 
-| 文件 | 说明 |
-|------|------|
-| `api_server.py` | 完整版 (需要 Python 3.11 + 模型) |
-| `api_server_simple.py` | 简化版 (模拟音频) |
-| `Dockerfile` | x86 版本 |
-| `Dockerfile.arm64` | ARM64/GB10 版本 |
-| `docker-compose.yml` | x86 部署 |
-| `docker-compose.arm64.yml` | ARM64 部署 |
-| `examples/voice_01.wav` | 你的音频 |
+- **模型下载慢**：已默认走 ModelScope 镜像，首次下载约 2GB
+- **Windows DeepSpeed 安装失败**：可跳过，去掉 `--all-extras` 改用 `--extra webui`
+- **GPU 检查**：`uv run tools/gpu_check.py`

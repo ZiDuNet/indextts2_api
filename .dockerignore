@@ -1,0 +1,25 @@
+# 模型文件（容器启动时自动下载）
+checkpoints/
+
+# 输出和缓存
+outputs/
+logs/
+assets/speaker_cache/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+
+# Git
+.git/
+
+# IDE 和工具
+.idea/
+.vscode/
+*.md
+!README.md
+
+# 临时文件
+*.tmp
+*.log

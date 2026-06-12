@@ -119,12 +119,26 @@ class TextNormalizer:
         if self.zh_normalizer is not None and self.en_normalizer is not None:
             return
         if platform.system() != "Linux":  # Mac and Windows
+            # 预检测 kaldifst 是否能安全导入（Windows 上可能 DLL 不兼容导致 segfault）
+            _kaldifst_ok = False
             try:
-                from wetext import Normalizer
-                self.zh_normalizer = Normalizer(remove_erhua=False, lang="zh", operator="tn")
-                self.en_normalizer = Normalizer(lang="en", operator="tn")
-            except ImportError:
-                # wetext 安装失败，使用简单版本
+                import subprocess, sys
+                result = subprocess.run(
+                    [sys.executable, "-c", "import kaldifst"],
+                    timeout=10, capture_output=True,
+                )
+                _kaldifst_ok = result.returncode == 0
+            except Exception:
+                pass
+            if _kaldifst_ok:
+                try:
+                    from wetext import Normalizer
+                    self.zh_normalizer = Normalizer(remove_erhua=False, lang="zh", operator="tn")
+                    self.en_normalizer = Normalizer(lang="en", operator="tn")
+                except Exception:
+                    self.zh_normalizer = None
+                    self.en_normalizer = None
+            else:
                 self.zh_normalizer = None
                 self.en_normalizer = None
         else:

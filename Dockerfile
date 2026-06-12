@@ -12,7 +12,10 @@ WORKDIR /app
 
 # 安装系统依赖
 RUN apt-get update && apt-get install -y \
-    git git-lfs curl python3.11 python3.11-dev python3-pip \
+    software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y \
+    git git-lfs curl python3.11 python3.11-dev python3.11-venv python3-pip \
     libsndfile1 ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
@@ -25,8 +28,8 @@ COPY . /app
 # Git LFS
 RUN git lfs install && git lfs pull
 
-# 安装 Python 依赖
-RUN uv sync --all-extras
+# 安装 Python 依赖（阿里云镜像）
+RUN uv sync --all-extras --default-index "https://mirrors.aliyun.com/pypi/simple"
 
 EXPOSE 8002
 

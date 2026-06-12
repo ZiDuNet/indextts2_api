@@ -35,15 +35,12 @@ RUN apt-get update && apt-get install -y \
 # 安装 uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 让 uv 显式知道要 3.11，避免 fallback 到系统 Python 3.10
-RUN uv python install 3.11
-
 # 复制项目文件
 COPY . /app
 
-# 安装 Python 依赖（指定 Python 3.11；只装 webui extra 避开 deepspeed，
-# deepspeed 无 ARM64/x86_12.8 预编译 wheel，从源码编译需要 nvcc + 5+ GB 镜像）
-RUN uv sync --python 3.11 --extra webui --default-index "https://mirrors.aliyun.com/pypi/simple"
+# 安装 Python 依赖（绝对路径指定 python3.11 避免 fallback 到系统 3.10；
+# 只装 webui extra 避开 deepspeed ARM64 无 wheel 的问题）
+RUN uv sync --python /usr/bin/python3.11 --extra webui --default-index "https://mirrors.aliyun.com/pypi/simple"
 
 EXPOSE 8002
 

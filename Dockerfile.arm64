@@ -2,7 +2,7 @@
 # 适用于 NVIDIA DGX GB10 (Blackwell ARM64 架构)
 # 使用 CUDA 13.x
 
-FROM nvidia/cuda:13.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:13.3.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1

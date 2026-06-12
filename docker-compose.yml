@@ -1,7 +1,5 @@
 # IndexTTS2 Docker Compose (x86)
 
-version: '3.8'
-
 services:
   indextts2:
     build:

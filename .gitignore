@@ -7,6 +7,7 @@ __pycache__/
 
 # Environments.
 .venv*/
+.uv-cache/
 venv*/
 conda_env*/
 

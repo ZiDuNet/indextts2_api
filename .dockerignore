@@ -10,6 +10,7 @@ assets/speaker_cache/
 __pycache__/
 *.pyc
 .venv/
+.uv-cache/
 
 # Git
 .git/

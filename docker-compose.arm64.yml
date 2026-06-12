@@ -2,6 +2,7 @@
 
 services:
   indextts2:
+    platform: linux/arm64
     build:
       context: .
       dockerfile: Dockerfile.arm64
@@ -14,7 +15,11 @@ services:
       - ./outputs:/app/outputs
     environment:
       - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - SKIP_MODEL_DOWNLOAD=1
+    gpus: all
+    shm_size: "8gb"
     deploy:
       resources:
         reservations:
@@ -26,6 +31,6 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 5m

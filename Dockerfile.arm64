@@ -1,49 +1,44 @@
-# IndexTTS2 ARM64 Dockerfile
-# 适用于 NVIDIA DGX GB10 (Blackwell ARM64)
-# 最小化基础镜像 + CUDA 13.x runtime 按需安装
+# IndexTTS2 ARM64 Dockerfile for NVIDIA DGX GB10 / DGX Spark.
+# The image uses CUDA 13 and the Linux aarch64 PyTorch CUDA wheel set.
 
-FROM ubuntu:22.04
+FROM --platform=linux/arm64 nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV HF_ENDPOINT=https://hf-mirror.com
 ENV PATH="/root/.local/bin:$PATH"
-# 让 PyTorch 在 ARM64 + CUDA 13 容器里能找到 .so
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}
+ENV UV_CACHE_DIR=/tmp/uv-cache
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 WORKDIR /app
 
-# 阿里云 apt 源 + NVIDIA CUDA 13.x (arm64) 仓库
-RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y wget gnupg2 && \
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        cuda-cudart-13-3 cuda-libraries-13-3 libcudnn9-cuda-13 libcublas-13-3 && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    libgomp1 \
+    libsndfile1 \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    tini \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
 
-# 系统依赖 + Python 3.11
-RUN apt-get update && apt-get install -y \
-    software-properties-common && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && apt-get install -y \
-    curl python3.11 python3.11-dev python3.11-venv python3-pip \
-    libsndfile1 ffmpeg && \
-    rm -rf /var/lib/apt/lists/* && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python
-
-# 安装 uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 复制项目文件
 COPY . /app
 
-# 安装 Python 依赖（绝对路径指定 python3.11 避免 fallback 到系统 3.10；
-# 只装 webui extra 避开 deepspeed 0.17.1 无 ARM64 wheel 的问题）
-RUN uv sync --python /usr/bin/python3.11 --extra webui --default-index "https://mirrors.aliyun.com/pypi/simple"
+# Do not install DeepSpeed on GB10. Keep BigVGAN on the pure torch fallback
+# path by leaving --use_cuda_kernel disabled in the runtime command.
+RUN uv sync --locked --python /usr/bin/python3.12 --extra webui --no-dev \
+    --default-index "https://mirrors.aliyun.com/pypi/simple" \
+    && uv run python -c "import platform, torch, torchaudio; print(platform.machine(), torch.__version__, torch.version.cuda, torchaudio.__version__)"
 
 EXPOSE 8002
 
+ENTRYPOINT ["tini", "--"]
 CMD ["uv", "run", "python", "api_server.py", "--host", "0.0.0.0", "--port", "8002", "--fp16"]

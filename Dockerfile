@@ -4,6 +4,8 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 ENV HF_ENDPOINT=https://hf-mirror.com
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_CACHE_DIR=/tmp/uv-cache

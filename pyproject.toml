@@ -54,8 +54,10 @@ dependencies = [
   "tensorboard==2.9.1",
   "textstat>=0.7.10",
   "tokenizers==0.21.0",
-  "torch==2.8.*",
-  "torchaudio==2.8.*",
+  # torch 2.9+ is required for ARM64 CUDA wheels (GB10 / Blackwell).
+  # x86_64 + Windows still uses 2.8.x via the cu128 index.
+  "torch>=2.8,<2.13",
+  "torchaudio>=2.8,<2.13",
   "tqdm>=4.67.1",
   "transformers==4.52.1",
 
@@ -122,5 +124,5 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cuda130"
 # PyTorch with CUDA 13.x for ARM64 (NVIDIA GB10 / Blackwell, CUDA driver >= 580)
-url = "https://download.pytorch.org/whl/cu130"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu130"
 explicit = true

@@ -119,6 +119,12 @@ class SpeechParams(BaseModel):
     use_random: bool = Field(False, description="是否随机采样情感。")
     interval_silence: int = Field(200, ge=0, le=1000, description="分段之间插入的静音毫秒数。")
     max_text_tokens_per_segment: int = Field(120, ge=20, le=240, description="单段最大文本 token 数。")
+    quick_streaming_tokens: int = Field(
+        60,
+        ge=0,
+        le=240,
+        description="流式首包目标 token 数，仅 WebSocket tts_stream 使用。越小首包越快，段数越多。",
+    )
     num_beams: int = Field(3, ge=1, le=10, description="搜索宽度。速度优先建议 1，质量优先可用 3。")
     do_sample: bool = Field(True, description="是否启用采样。速度优先可关闭。")
     top_k: int = Field(30, ge=1, le=100, description="Top-K 采样参数。")
@@ -329,6 +335,38 @@ def _do_infer(text: str, spk_audio_prompt: str, output_path: str, params: dict):
     return result
 
 
+def _wav_chunk_to_numpy(wav) -> np.ndarray:
+    if hasattr(wav, "detach"):
+        wav = wav.detach().cpu()
+    if hasattr(wav, "numpy"):
+        wav = wav.numpy()
+    arr = np.asarray(wav)
+    if arr.dtype != np.int16:
+        arr = np.clip(arr, -32767, 32767).astype(np.int16)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim == 2 and arr.shape[0] <= 8:
+        arr = arr.T
+    return np.ascontiguousarray(arr)
+
+
+def _concat_wav_chunks(chunks: list[np.ndarray]) -> np.ndarray:
+    valid_chunks = [chunk for chunk in chunks if chunk.size > 0]
+    if not valid_chunks:
+        return np.zeros((0, 1), dtype=np.int16)
+    return np.ascontiguousarray(np.concatenate(valid_chunks, axis=0))
+
+
+_STREAM_DONE = object()
+
+
+def _next_stream_item(generator):
+    try:
+        return next(generator)
+    except StopIteration:
+        return _STREAM_DONE
+
+
 async def _acquire_with_timeout(semaphore: asyncio.Semaphore, timeout: float) -> bool:
     try:
         await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
@@ -362,6 +400,110 @@ async def _guarded_infer(text: str, spk: str, output_path: str, params: dict):
             "total_time": time.perf_counter() - request_start,
         }
     finally:
+        _queue_slots.release()
+
+
+async def _guarded_stream_to_ws(
+    ws: WebSocket,
+    text: str,
+    spk: str,
+    output_path: str,
+    params: dict,
+    output_format: str,
+    quick_streaming_tokens: int,
+):
+    request_start = time.perf_counter()
+    if _queue_slots is None or _gpu_semaphore is None:
+        raise RuntimeError("推理队列尚未初始化")
+
+    accepted = await _acquire_with_timeout(_queue_slots, args.queue_timeout)
+    if not accepted:
+        raise TimeoutError(f"推理队列已满，请稍后重试（等待超过 {args.queue_timeout:.1f}s）")
+
+    chunk_count = 0
+    chunk_bytes = 0
+    chunks: list[np.ndarray] = []
+    gpu_acquired = False
+    generator = None
+
+    try:
+        await _gpu_semaphore.acquire()
+        gpu_acquired = True
+        queue_elapsed = time.perf_counter() - request_start
+        infer_start = time.perf_counter()
+
+        await ws.send_json({
+            "type": "stream_started",
+            "format": output_format,
+            "media_type": MEDIA_TYPES[output_format],
+            "sample_rate": 22050,
+            "queue_time": round(queue_elapsed, 3),
+            "quick_streaming_tokens": quick_streaming_tokens,
+        })
+
+        generator = tts.infer(
+            spk_audio_prompt=spk,
+            text=text,
+            output_path=None,
+            stream_return=True,
+            more_segment_before=quick_streaming_tokens,
+            **params,
+        )
+        while True:
+            item = await asyncio.to_thread(_next_stream_item, generator)
+            if item is _STREAM_DONE:
+                break
+
+            chunk = _wav_chunk_to_numpy(item)
+            if chunk.size == 0:
+                continue
+            chunks.append(chunk)
+            elapsed = time.perf_counter() - infer_start
+            total_elapsed = time.perf_counter() - request_start
+            chunk_count += 1
+            audio_bytes, media_type = _encode_audio(chunk, 22050, output_format)
+            chunk_bytes += len(audio_bytes)
+            await ws.send_json({
+                "type": "stream_chunk",
+                "chunk_index": chunk_count,
+                "audio_base64": base64.b64encode(audio_bytes).decode(),
+                "format": output_format,
+                "media_type": media_type,
+                "sample_rate": 22050,
+                "byte_count": len(audio_bytes),
+                "queue_time": round(queue_elapsed, 3),
+                "infer_time": round(elapsed, 3),
+                "total_time": round(total_elapsed, 3),
+            })
+
+        full_wav = _concat_wav_chunks(chunks)
+        if output_path and full_wav.size > 0:
+            sf.write(output_path, full_wav, 22050, subtype="PCM_16")
+        elapsed = time.perf_counter() - infer_start
+        total_elapsed = time.perf_counter() - request_start
+        audio_bytes, media_type = _encode_audio(full_wav, 22050, output_format)
+        await ws.send_json({
+            "type": "stream_completed",
+            "audio_base64": base64.b64encode(audio_bytes).decode(),
+            "format": output_format,
+            "media_type": media_type,
+            "sample_rate": 22050,
+            "chunk_count": chunk_count,
+            "chunk_bytes": chunk_bytes,
+            "byte_count": len(audio_bytes),
+            "queue_time": round(queue_elapsed, 3),
+            "infer_time": round(elapsed, 3),
+            "total_time": round(total_elapsed, 3),
+        })
+        return
+    finally:
+        if generator is not None:
+            try:
+                generator.close()
+            except Exception:
+                pass
+        if gpu_acquired:
+            _gpu_semaphore.release()
         _queue_slots.release()
 
 
@@ -542,7 +684,7 @@ async def websocket_docs():
         },
         "message_types": {
             "tts": "普通 WebSocket 合成，完成后一次性返回 base64 音频",
-            "tts_stream": "流式合成入口，当前实现完成后返回 base64 音频",
+            "tts_stream": "真正分段流式合成：先返回 stream_started，然后持续返回 stream_chunk，最后返回 stream_completed",
             "ping": "心跳检测，返回 pong",
             "get_voices": "返回当前音色元数据",
         },
@@ -559,6 +701,7 @@ async def websocket_docs():
             "max_mel_tokens": 900,
             "diffusion_steps": 12,
             "repetition_penalty": 10.0,
+            "quick_streaming_tokens": 60,
         },
         "tts_response_example": {
             "type": "completed",
@@ -570,6 +713,30 @@ async def websocket_docs():
             "infer_time": 1.23,
             "total_time": 1.23,
         },
+        "stream_response_sequence": [
+            {
+                "type": "stream_started",
+                "format": "wav",
+                "sample_rate": 22050,
+                "queue_time": 0.0,
+            },
+            {
+                "type": "stream_chunk",
+                "chunk_index": 1,
+                "audio_base64": "<chunk wav base64>",
+                "format": "wav",
+                "sample_rate": 22050,
+                "infer_time": 0.8,
+            },
+            {
+                "type": "stream_completed",
+                "audio_base64": "<full wav base64>",
+                "chunk_count": 3,
+                "format": "wav",
+                "sample_rate": 22050,
+                "total_time": 5.6,
+            },
+        ],
         "supported_speech_params": [
             "voice",
             "text",
@@ -584,6 +751,7 @@ async def websocket_docs():
             "use_random",
             "interval_silence",
             "max_text_tokens_per_segment",
+            "quick_streaming_tokens",
             "num_beams",
             "do_sample",
             "top_k",
@@ -853,6 +1021,8 @@ async def websocket_endpoint(ws: WebSocket):
                     except ValueError as e:
                         await manager.send_json({"type": "error", "message": str(e)}, ws)
                         continue
+                    quick_streaming_tokens = int(data.get("quick_streaming_tokens") or 60)
+                    quick_streaming_tokens = max(0, min(quick_streaming_tokens, 240))
 
                     spk = _resolve_speaker(data) or "examples/voice_01.wav"
                     output_format = data.get("response_format") or "wav"
@@ -864,7 +1034,17 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
 
                     if msg_type == "tts_stream":
-                        await manager.send_json({"type": "stream_started"}, ws)
+                        output_path = _unique_output_path("ws_stream_")
+                        await _guarded_stream_to_ws(
+                            ws,
+                            text.strip(),
+                            spk,
+                            output_path,
+                            params,
+                            output_format,
+                            quick_streaming_tokens,
+                        )
+                        continue
 
                     output_path = _unique_output_path("ws_")
                     infer_record = await _guarded_infer(text, spk, output_path, params)

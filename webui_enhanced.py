@@ -7,11 +7,15 @@ WebSocket 合成、请求体和响应头回显。
 import argparse
 import asyncio
 import base64
+import io
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
 
 import gradio as gr
@@ -64,6 +68,47 @@ def _save_response(content: bytes, response_format: str, prefix: str) -> str:
     path = out_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.{ext}"
     path.write_bytes(content)
     return str(path)
+
+
+def _save_pcm_preview(content: bytes, prefix: str, sample_rate: int = 22050) -> str:
+    out_dir = Path("outputs")
+    out_dir.mkdir(exist_ok=True)
+    path = out_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}_preview.wav"
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(content)
+    return str(path)
+
+
+def _save_playable_preview(content: bytes, response_format: str, prefix: str, sample_rate: int = 22050) -> str | None:
+    if response_format in ("wav", "mp3"):
+        return None
+    if response_format == "pcm":
+        return _save_pcm_preview(content, prefix, sample_rate=sample_rate)
+    if not shutil.which("ffmpeg"):
+        return None
+
+    input_args = ["-f", "adts"] if response_format == "aac" else []
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", *input_args, "-i", "pipe:0", "-f", "wav", "pipe:1"],
+        input=content,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return _save_response(proc.stdout, "wav", f"{prefix}_preview")
+
+
+def _audio_output_paths(content: bytes, response_format: str, prefix: str, sample_rate: int = 22050) -> tuple[str | None, str]:
+    raw_path = _save_response(content, response_format, prefix)
+    if response_format in ("wav", "mp3"):
+        return raw_path, raw_path
+    preview_path = _save_playable_preview(content, response_format, prefix, sample_rate=sample_rate)
+    return preview_path, raw_path
 
 
 def _optional_text(value: str | None):
@@ -119,11 +164,22 @@ class WebSocketSession:
 
     async def _send(self, payload: dict):
         await self.websocket.send(json.dumps(payload, ensure_ascii=False))
+        stream_started = None
+        stream_chunks = []
         while True:
             message = json.loads(await self.websocket.recv())
-            if message.get("type") in {"stream_started"}:
+            msg_type = message.get("type")
+            if msg_type == "stream_started":
+                stream_started = message
                 continue
-            if message.get("type") in {"completed", "stream_completed", "error", "pong", "voices_list"}:
+            if msg_type == "stream_chunk":
+                stream_chunks.append(message)
+                continue
+            if msg_type in {"completed", "stream_completed", "error", "pong", "voices_list"}:
+                if stream_started:
+                    message["stream_started"] = stream_started
+                if stream_chunks:
+                    message["stream_chunks"] = stream_chunks
                 self.message_count += 1
                 return message
 
@@ -173,6 +229,7 @@ def build_speech_payload(
     use_random,
     interval_silence,
     max_text_tokens_per_segment,
+    quick_streaming_tokens,
     num_beams,
     do_sample,
     top_k,
@@ -198,6 +255,7 @@ def build_speech_payload(
         "use_random": bool(use_random),
         "interval_silence": int(interval_silence),
         "max_text_tokens_per_segment": int(max_text_tokens_per_segment),
+        "quick_streaming_tokens": int(quick_streaming_tokens),
         "num_beams": int(num_beams),
         "do_sample": bool(do_sample),
         "top_k": int(top_k),
@@ -323,15 +381,23 @@ def synthesize_via_api(api_base, api_mode, openai_model, *values):
             body = resp.json() if resp.content else {}
             return None, None, request_echo, _response_echo(resp.status_code, elapsed, resp.headers, body=body)
 
-        output_path = _save_response(resp.content, payload["response_format"], "api_tts")
-        playable_audio = output_path if payload["response_format"] in ("wav", "mp3") else None
-        return playable_audio, output_path, request_echo, _response_echo(
+        sample_rate = int(resp.headers.get("x-indextts-sample-rate", "22050"))
+        playable_audio, output_path = _audio_output_paths(
+            resp.content,
+            payload["response_format"],
+            "api_tts",
+            sample_rate=sample_rate,
+        )
+        response_echo = _response_echo(
             resp.status_code,
             elapsed,
             resp.headers,
             output_file=output_path,
             byte_count=len(resp.content),
         )
+        if playable_audio and playable_audio != output_path:
+            response_echo["预览文件"] = playable_audio
+        return playable_audio, output_path, request_echo, response_echo
     except Exception as exc:
         return None, None, request_echo, {"错误": str(exc)}
 
@@ -405,11 +471,37 @@ def ws_send_tts(api_base, session_id, message_type, *values):
         audio_path = None
         playable_audio = None
         response_format = message.get("format") or payload.get("response_format", "wav")
+        chunk_files = []
+        stream_chunks = message.pop("stream_chunks", [])
+        for chunk in stream_chunks:
+            chunk_format = chunk.get("format") or response_format
+            chunk_bytes = base64.b64decode(chunk.get("audio_base64", ""))
+            chunk_playable, chunk_path = _audio_output_paths(
+                chunk_bytes,
+                chunk_format,
+                f"ws_chunk_{chunk.get('chunk_index', len(chunk_files) + 1)}",
+                sample_rate=int(chunk.get("sample_rate") or 22050),
+            )
+            chunk_echo = {key: value for key, value in chunk.items() if key != "audio_base64"}
+            chunk_echo["audio_file"] = chunk_path
+            if chunk_playable and chunk_playable != chunk_path:
+                chunk_echo["preview_file"] = chunk_playable
+            chunk_files.append(chunk_echo)
+
         if message.get("audio_base64"):
-            audio_path = _save_response(base64.b64decode(message["audio_base64"]), response_format, "ws_tts")
-            playable_audio = audio_path if response_format in ("wav", "mp3") else None
+            final_bytes = base64.b64decode(message["audio_base64"])
+            playable_audio, audio_path = _audio_output_paths(
+                final_bytes,
+                response_format,
+                "ws_tts",
+                sample_rate=int(message.get("sample_rate") or 22050),
+            )
             message = {key: value for key, value in message.items() if key != "audio_base64"}
             message["audio_file"] = audio_path
+            if playable_audio and playable_audio != audio_path:
+                message["preview_file"] = playable_audio
+        if chunk_files:
+            message["stream_chunks"] = chunk_files
 
         return playable_audio, audio_path, request_echo, {
             "耗时秒": round(elapsed, 3),
@@ -517,6 +609,7 @@ def create_webui(get_tts):
                                 quality_btn = gr.Button("质量优先")
                             interval_silence = gr.Slider(0, 1000, value=200, step=10, label="分段静音毫秒")
                             max_text_tokens_per_segment = gr.Slider(20, 240, value=120, step=5, label="单段最大文本 token")
+                            quick_streaming_tokens = gr.Slider(0, 240, value=60, step=5, label="流式首包 token")
                             num_beams = gr.Slider(1, 10, value=3, step=1, label="搜索宽度")
                             do_sample = gr.Checkbox(label="启用采样", value=True)
                             top_k = gr.Slider(1, 100, value=30, step=1, label="Top-K")
@@ -580,6 +673,7 @@ def create_webui(get_tts):
                                 ws_quality_btn = gr.Button("质量优先")
                             ws_interval_silence = gr.Slider(0, 1000, value=200, step=10, label="分段静音毫秒")
                             ws_max_text_tokens_per_segment = gr.Slider(20, 240, value=120, step=5, label="单段最大文本 token")
+                            ws_quick_streaming_tokens = gr.Slider(0, 240, value=60, step=5, label="流式首包 token")
                             ws_num_beams = gr.Slider(1, 10, value=3, step=1, label="搜索宽度")
                             ws_do_sample = gr.Checkbox(label="启用采样", value=True)
                             ws_top_k = gr.Slider(1, 100, value=30, step=1, label="Top-K")
@@ -618,6 +712,7 @@ def create_webui(get_tts):
             use_random,
             interval_silence,
             max_text_tokens_per_segment,
+            quick_streaming_tokens,
             num_beams,
             do_sample,
             top_k,
@@ -650,6 +745,7 @@ def create_webui(get_tts):
             ws_use_random,
             ws_interval_silence,
             ws_max_text_tokens_per_segment,
+            ws_quick_streaming_tokens,
             ws_num_beams,
             ws_do_sample,
             ws_top_k,

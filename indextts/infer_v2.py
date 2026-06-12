@@ -296,11 +296,14 @@ class IndexTTS2:
         Silences to be insert between generated segments.
         """
 
-        if not wavs or interval_silence <= 0:
-            return wavs
+        if not wavs:
+            return torch.zeros(1, 0)
 
         # get channel_size
         channel_size = wavs[0].size(0)
+        if interval_silence <= 0:
+            return torch.zeros(channel_size, 0)
+
         # get silence tensor
         sil_dur = int(sampling_rate * interval_silence / 1000.0)
         return torch.zeros(channel_size, sil_dur)

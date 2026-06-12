@@ -572,6 +572,21 @@ class IndexTTS2:
                         emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
                         # emovec = emovec_mat
 
+                    gpt_generation_kwargs = {
+                        "do_sample": do_sample,
+                        "num_return_sequences": autoregressive_batch_size,
+                        "length_penalty": length_penalty,
+                        "num_beams": num_beams,
+                        "repetition_penalty": repetition_penalty,
+                        "max_generate_length": max_mel_tokens,
+                    }
+                    if do_sample:
+                        gpt_generation_kwargs.update({
+                            "top_p": top_p,
+                            "top_k": top_k,
+                            "temperature": temperature,
+                        })
+
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
@@ -579,15 +594,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=do_sample,
-                        top_p=top_p,
-                        top_k=top_k,
-                        temperature=temperature,
-                        num_return_sequences=autoregressive_batch_size,
-                        length_penalty=length_penalty,
-                        num_beams=num_beams,
-                        repetition_penalty=repetition_penalty,
-                        max_generate_length=max_mel_tokens,
+                        **gpt_generation_kwargs,
                         **generation_kwargs
                     )
 

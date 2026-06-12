@@ -70,12 +70,17 @@ def ensure_models_available(model_dir: str, bigvgan_repo: str = _BIGVGAN_REPO) -
 
     Call this once at startup before creating ``IndexTTS2``.
 
+    Honors the env var ``SKIP_MODEL_DOWNLOAD=1`` — if set, missing files
+    are logged but the function still returns the expected paths so
+    callers can decide what to do (e.g. fail fast or run in degraded mode).
+
     Returns a dict of local paths:
         - ``w2v_bert``: directory containing w2v-bert-2.0 model
         - ``semantic_codec``: path to semantic_codec/model.safetensors
         - ``campplus``: path to campplus_cn_common.bin
         - ``bigvgan``: directory containing config.json + bigvgan_generator.pt
     """
+    skip = os.environ.get("SKIP_MODEL_DOWNLOAD", "").lower() in ("1", "true", "yes")
     # 辅助模型直接放在 checkpoints/ 下，与主模型平级
     ckpt_root = os.path.dirname(model_dir)  # e.g. "checkpoints/" from "checkpoints/IndexTTS-2"
     if not ckpt_root:
@@ -86,33 +91,45 @@ def ensure_models_available(model_dir: str, bigvgan_repo: str = _BIGVGAN_REPO) -
     # 1. w2v-bert-2.0 (full repo — needed by SeamlessM4T and Wav2Vec2BertModel)
     w2v_dir = os.path.join(ckpt_root, "w2v-bert-2.0")
     if not os.path.isdir(w2v_dir) or not os.listdir(w2v_dir):
-        print(f">> Downloading w2v-bert-2.0 to {w2v_dir}...")
-        snapshot_download("facebook/w2v-bert-2.0", local_dir=w2v_dir)
+        if skip:
+            logger.warning(f"SKIP_MODEL_DOWNLOAD=1, missing w2v-bert-2.0 at {w2v_dir}")
+        else:
+            print(f">> Downloading w2v-bert-2.0 to {w2v_dir}...")
+            snapshot_download("facebook/w2v-bert-2.0", local_dir=w2v_dir)
     paths["w2v_bert"] = w2v_dir
 
     # 2. MaskGCT semantic codec
     maskgct_dir = os.path.join(ckpt_root, "MaskGCT")
     maskgct_path = os.path.join(maskgct_dir, "semantic_codec_model.safetensors")
     if not os.path.isfile(maskgct_path):
-        print(f">> Downloading MaskGCT semantic codec to {maskgct_path}...")
-        _download_single_file("amphion/MaskGCT", "semantic_codec/model.safetensors", maskgct_path)
+        if skip:
+            logger.warning(f"SKIP_MODEL_DOWNLOAD=1, missing {maskgct_path}")
+        else:
+            print(f">> Downloading MaskGCT semantic codec to {maskgct_path}...")
+            _download_single_file("amphion/MaskGCT", "semantic_codec/model.safetensors", maskgct_path)
     paths["semantic_codec"] = maskgct_path
 
     # 3. CAMPPlus speaker embedding model
     campplus_dir = os.path.join(ckpt_root, "campplus")
     campplus_path = os.path.join(campplus_dir, "campplus_cn_common.bin")
     if not os.path.isfile(campplus_path):
-        print(f">> Downloading CAMPPlus to {campplus_path}...")
-        _download_single_file("funasr/campplus", "campplus_cn_common.bin", campplus_path)
+        if skip:
+            logger.warning(f"SKIP_MODEL_DOWNLOAD=1, missing {campplus_path}")
+        else:
+            print(f">> Downloading CAMPPlus to {campplus_path}...")
+            _download_single_file("funasr/campplus", "campplus_cn_common.bin", campplus_path)
     paths["campplus"] = campplus_path
 
     # 4. BigVGAN vocoder (config + weights)
     bigvgan_dir = os.path.join(ckpt_root, "bigvgan")
     if not os.path.isdir(bigvgan_dir) or not os.path.isfile(os.path.join(bigvgan_dir, "config.json")):
-        print(f">> Downloading BigVGAN to {bigvgan_dir}...")
-        os.makedirs(bigvgan_dir, exist_ok=True)
-        _download_single_file(bigvgan_repo, "config.json", os.path.join(bigvgan_dir, "config.json"))
-        _download_single_file(bigvgan_repo, "bigvgan_generator.pt", os.path.join(bigvgan_dir, "bigvgan_generator.pt"))
+        if skip:
+            logger.warning(f"SKIP_MODEL_DOWNLOAD=1, missing BigVGAN at {bigvgan_dir}")
+        else:
+            print(f">> Downloading BigVGAN to {bigvgan_dir}...")
+            os.makedirs(bigvgan_dir, exist_ok=True)
+            _download_single_file(bigvgan_repo, "config.json", os.path.join(bigvgan_dir, "config.json"))
+            _download_single_file(bigvgan_repo, "bigvgan_generator.pt", os.path.join(bigvgan_dir, "bigvgan_generator.pt"))
     paths["bigvgan"] = bigvgan_dir
 
     print(">> All auxiliary models ready.")

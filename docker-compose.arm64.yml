@@ -14,6 +14,7 @@ services:
       - ./outputs:/app/outputs
     environment:
       - CUDA_VISIBLE_DEVICES=0
+      - SKIP_MODEL_DOWNLOAD=1
     deploy:
       resources:
         reservations:

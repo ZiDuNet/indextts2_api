@@ -177,19 +177,25 @@ manager = ConnectionManager()
 # ============== 主模型自动下载 ==============
 
 def _ensure_main_model(model_dir: str):
-    """如果主模型不存在，从 ModelScope 自动下载（缓存到 H 盘避免 C 盘空间不足）"""
+    """主模型缺失时从 ModelScope 自动补全（已存在则跳过）"""
     cfg_path = os.path.join(model_dir, "config.yaml")
     if os.path.exists(cfg_path):
         return
 
     logger.info(f"主模型不存在，从 ModelScope 下载到 {model_dir} ...")
-    ms_cache = os.environ.get("MODELSCOPE_CACHE", "H:/modelscope_cache")
+    # Linux 服务器上默认写到 $HOME/.cache/modelscope，Windows 上写到 C 盘用户目录；
+    # 都可通过 MODELSCOPE_CACHE 环境变量覆盖。
+    default_cache = os.path.join(
+        os.path.expanduser("~"), ".cache", "modelscope"
+    )
+    ms_cache = os.environ.get("MODELSCOPE_CACHE", default_cache)
     os.makedirs(ms_cache, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     try:
         from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot
-        ms_snapshot(model_id="IndexTeam/IndexTTS-2", cache_dir=ms_cache)
+        # exist_ok=True 让 modelscope 在文件已存在时直接复用，不重复下载
+        ms_snapshot(model_id="IndexTeam/IndexTTS-2", cache_dir=ms_cache, exist_ok=True)
 
         # 从缓存目录复制到 model_dir
         src_dir = os.path.join(ms_cache, "IndexTeam", "IndexTTS-2")

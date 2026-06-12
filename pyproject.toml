@@ -33,6 +33,8 @@ dependencies = [
   "cython==3.0.7",
   "descript-audiotools==0.7.2",
   "einops>=0.8.1",
+  # API server runtime deps (api_server.py)
+  "fastapi>=0.110,<1.0",
   "ffmpeg-python==0.2.0",
   "g2p-en==2.1.0",
   "jieba==0.42.1",
@@ -48,6 +50,7 @@ dependencies = [
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",
   "pandas==2.3.2",
+  "python-multipart>=0.0.9",  # FastAPI UploadFile / Form parsing
   "safetensors==0.5.2",
   "soundfile>=0.12.1",
   "sentencepiece>=0.2.1",
@@ -60,6 +63,7 @@ dependencies = [
   "torchaudio>=2.8,<2.13",
   "tqdm>=4.67.1",
   "transformers==4.52.1",
+  "uvicorn[standard]>=0.27,<1.0",
 
   # Use "wetext" on all platforms (avoids pynini/OpenFst compilation issues)
   "wetext>=0.0.9",

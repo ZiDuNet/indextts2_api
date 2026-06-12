@@ -7,6 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV HF_ENDPOINT=https://hf-mirror.com
 ENV PATH="/root/.local/bin:$PATH"
+# 让 PyTorch 在 x86_64 + CUDA 12 容器里能找到 .so
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 

@@ -8,6 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV HF_ENDPOINT=https://hf-mirror.com
 ENV PATH="/root/.local/bin:$PATH"
+# 让 PyTorch 在 ARM64 + CUDA 13 容器里能找到 .so
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
@@ -29,7 +31,8 @@ RUN apt-get update && apt-get install -y \
     apt-get update && apt-get install -y \
     curl python3.11 python3.11-dev python3.11-venv python3-pip \
     libsndfile1 ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python
 
 # 安装 uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh

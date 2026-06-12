@@ -28,6 +28,7 @@ def _get_using_modelscope() -> bool:
 HF_TO_MODELSCOPE_REPO_MAP = {
     "funasr/campplus": "iic/speech_campplus_sv_zh-cn_16k-common",
     "facebook/w2v-bert-2.0": "AI-ModelScope/w2v-bert-2.0",
+    "nvidia/bigvgan_v2_22khz_80band_256x": "nv-community/bigvgan_v2_22khz_80band_256x",
 }
 
 # Default BigVGAN repo (also in config.yaml, but needed for pre-download)

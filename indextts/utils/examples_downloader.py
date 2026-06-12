@@ -13,7 +13,8 @@ import json
 import logging
 import os
 from typing import List, Set
-from urllib.request import urlopen, Request
+
+import requests
 
 from indextts.utils.network_detection import need_proxy
 
@@ -39,36 +40,31 @@ def _download_file(url: str, local_path: str, timeout: int = 60, min_size: int =
 
     Raises RuntimeError if the server returns an error or non-binary content.
     """
-    req = Request(url, headers={"User-Agent": "IndexTTS/2.0"})
-    with urlopen(req, timeout=timeout) as response:
-        status = response.status
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"Server returned HTTP {status} for {url}")
-        content_type = response.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            raise RuntimeError(
-                f"Server returned HTML instead of binary file for {url} "
-                f"(Content-Type: {content_type}). The URL may be invalid."
-            )
-
-        # Write to a temp file first, then rename atomically
-        tmp_path = local_path + ".tmp"
-        try:
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            if min_size and os.path.getsize(tmp_path) < min_size:
+    tmp_path = local_path + ".tmp"
+    try:
+        with requests.get(url, stream=True, timeout=timeout,
+                          headers={"User-Agent": "IndexTTS/2.0"},
+                          allow_redirects=True) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type:
                 raise RuntimeError(
-                    f"Downloaded file is suspiciously small "
-                    f"({os.path.getsize(tmp_path)} bytes) for {url}"
+                    f"Server returned HTML instead of binary file for {url} "
+                    f"(Content-Type: {content_type}). The URL may be invalid."
                 )
-            os.replace(tmp_path, local_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            with open(tmp_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        if min_size and os.path.getsize(tmp_path) < min_size:
+            raise RuntimeError(
+                f"Downloaded file is suspiciously small "
+                f"({os.path.getsize(tmp_path)} bytes) for {url}"
+            )
+        os.replace(tmp_path, local_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def get_required_files() -> List[str]:

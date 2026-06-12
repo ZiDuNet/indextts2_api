@@ -5,6 +5,7 @@ import json
 import re
 import time
 import librosa
+import soundfile as sf
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
@@ -702,7 +703,8 @@ class IndexTTS2:
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            wav_data = wav.type(torch.int16).numpy().T
+            sf.write(output_path, wav_data, sampling_rate, subtype="PCM_16")
             print(">> wav file saved to:", output_path)
             if stream_return:
                 return None
